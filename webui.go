@@ -105,15 +105,26 @@ function renderRooms(rooms) {
 
   rooms.forEach(room => {
     const tr = document.createElement('tr');
+    const canStop = !!room.can_stop;
+    const stateTextMap = {
+      running: '录制中',
+      stopping: '停止中',
+      idle: '已停止',
+      error: '错误'
+    };
+    const stateText = stateTextMap[room.state] || (room.state || '');
+    const stopBtn = canStop
+      ? '<button onclick="stopOneByUrl(this.dataset.url)" data-url="' + encodeURIComponent(room.url || '') + '">停止</button>'
+      : '<button disabled>已停止</button>';
     tr.innerHTML =
       '<td>' + (room.url || '') + '</td>' +
-      '<td>' + (room.state || '') + '</td>' +
+      '<td>' + stateText + '</td>' +
       '<td>' + formatDuration(room.uptime_seconds) + '</td>' +
       '<td>' + (room.speed_kb_per_s || 0).toFixed(2) + ' KB/s</td>' +
       '<td>' + (room.segments_done || 0) + '</td>' +
       '<td>' + formatBytes(room.bytes_done) + '</td>' +
       '<td>' + (room.error || '') + '</td>' +
-      '<td class="actions"><button onclick="stopOneByUrl(this.dataset.url)" data-url="' + encodeURIComponent(room.url || '') + '">停止</button></td>';
+      '<td class="actions">' + stopBtn + '</td>';
     tbody.appendChild(tr);
   });
 }

@@ -37,8 +37,12 @@ type roomRecorder struct {
 	url string
 
 	startedAt    time.Time
+	stoppedAt    time.Time
 	segmentsDone int64
 	bytesDone    int64
+	speedBps     float64
+	lastStatAt   time.Time
+	lastStatSize int64
 
 	sessionDir string
 }
@@ -71,6 +75,7 @@ type RoomStatus struct {
 	UptimeSeconds   int64         `json:"uptime_seconds"`
 	SpeedBytesPerS  float64       `json:"speed_bytes_per_s"`
 	SpeedKBytesPerS float64       `json:"speed_kb_per_s"`
+	CanStop         bool          `json:"can_stop"`
 }
 
 type Status struct {
@@ -91,11 +96,18 @@ func (r *Recorder) GetStatus() Status {
 		var uptime int64
 		if !room.startedAt.IsZero() {
 			started = room.startedAt.Format(time.RFC3339)
-			uptime = int64(time.Since(room.startedAt).Seconds())
+			endAt := time.Now()
+			if (room.state == StateIdle || room.state == StateError) && !room.stoppedAt.IsZero() {
+				endAt = room.stoppedAt
+			}
+			uptime = int64(endAt.Sub(room.startedAt).Seconds())
+			if uptime < 0 {
+				uptime = 0
+			}
 		}
-		speed := 0.0
-		if uptime > 0 {
-			speed = float64(room.bytesDone) / float64(uptime)
+		speed := room.speedBps
+		if room.state != StateRunning && room.state != StateStopping {
+			speed = 0
 		}
 		if room.state == StateRunning {
 			active++
@@ -110,6 +122,7 @@ func (r *Recorder) GetStatus() Status {
 			UptimeSeconds:   uptime,
 			SpeedBytesPerS:  speed,
 			SpeedKBytesPerS: speed / 1024,
+			CanStop:         room.state == StateRunning || room.state == StateStopping,
 		})
 	}
 
@@ -149,6 +162,7 @@ func (r *Recorder) Start(m3u8URL string) error {
 		lastErr:    "",
 		url:        m3u8URL,
 		startedAt:  time.Now(),
+		stoppedAt:  time.Time{},
 		sessionDir: sessionDir,
 	}
 	room.runCtx, room.cancelRun = context.WithCancel(context.Background())
@@ -204,6 +218,8 @@ func (r *Recorder) setError(url string, err error) {
 	}
 	room.state = StateError
 	room.lastErr = err.Error()
+	room.stoppedAt = time.Now()
+	room.speedBps = 0
 }
 
 func (r *Recorder) setIdle(url string) {
@@ -214,6 +230,10 @@ func (r *Recorder) setIdle(url string) {
 		return
 	}
 	room.state = StateIdle
+	if room.stoppedAt.IsZero() {
+		room.stoppedAt = time.Now()
+	}
+	room.speedBps = 0
 }
 
 func (r *Recorder) setStats(url string, segCount, totalBytes int64) {
@@ -225,6 +245,19 @@ func (r *Recorder) setStats(url string, segCount, totalBytes int64) {
 	}
 	room.segmentsDone = segCount
 	room.bytesDone = totalBytes
+	now := time.Now()
+	if !room.lastStatAt.IsZero() {
+		dt := now.Sub(room.lastStatAt).Seconds()
+		if dt > 0 {
+			delta := totalBytes - room.lastStatSize
+			if delta < 0 {
+				delta = 0
+			}
+			room.speedBps = float64(delta) / dt
+		}
+	}
+	room.lastStatAt = now
+	room.lastStatSize = totalBytes
 }
 
 func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir string) {
