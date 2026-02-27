@@ -261,14 +261,17 @@ func (r *Recorder) loop(ctx context.Context, m3u8URL string) {
 		default:
 		}
 
-		playlistBody, err := fetchText(ctx, client, m3u8URL, r.requestUA)
+		playlistBody, finalPlaylistURL, statusCode, err := fetchText(ctx, client, m3u8URL, r.requestUA)
 		if err != nil {
-			log.Printf("[room=%s] fetch playlist failed: %v", m3u8URL, err)
+			log.Printf("[room=%s] fetch playlist failed: status=%d final_url=%s err=%v", m3u8URL, statusCode, finalPlaylistURL, err)
 			r.setError(m3u8URL, fmt.Errorf("fetch playlist: %w", err))
 			return
 		}
+		if finalPlaylistURL != "" && finalPlaylistURL != m3u8URL {
+			log.Printf("[room=%s] playlist redirected: %s -> %s (status=%d)", m3u8URL, m3u8URL, finalPlaylistURL, statusCode)
+		}
 
-		pl, err := ParseM3U8(m3u8URL, playlistBody)
+		pl, err := ParseM3U8(finalPlaylistURL, playlistBody)
 		if err != nil {
 			r.setError(m3u8URL, fmt.Errorf("parse playlist: %w", err))
 			return
@@ -324,28 +327,35 @@ func (r *Recorder) loop(ctx context.Context, m3u8URL string) {
 	}
 }
 
-func fetchText(ctx context.Context, client *http.Client, url string, requestUA string) (string, error) {
+func fetchText(ctx context.Context, client *http.Client, url string, requestUA string) (body string, finalURL string, statusCode int, err error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return "", err
+		return "", "", 0, err
+	}
+	if requestUA != "" {
+		req.Header.Set("User-Agent", requestUA)
 	}
 	if requestUA != "" {
 		req.Header.Set("User-Agent", requestUA)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return "", "", 0, err
 	}
 	defer resp.Body.Close()
+	resolvedURL := url
+	if resp.Request != nil && resp.Request.URL != nil {
+		resolvedURL = resp.Request.URL.String()
+	}
 	if resp.StatusCode/100 != 2 {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return "", fmt.Errorf("http %d %s, content-type=%q, body=%q", resp.StatusCode, http.StatusText(resp.StatusCode), resp.Header.Get("Content-Type"), string(snippet))
+		return "", resolvedURL, resp.StatusCode, fmt.Errorf("http %d %s, content-type=%q, body=%q", resp.StatusCode, http.StatusText(resp.StatusCode), resp.Header.Get("Content-Type"), string(snippet))
 	}
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return "", resolvedURL, resp.StatusCode, err
 	}
-	return string(b), nil
+	return string(b), resolvedURL, resp.StatusCode, nil
 }
 
 func downloadFile(ctx context.Context, client *http.Client, url, outPath, requestUA string) (int64, error) {
