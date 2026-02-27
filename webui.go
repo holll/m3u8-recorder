@@ -40,27 +40,91 @@ var indexTpl = template.Must(template.New("index").Parse(`
   <meta charset="utf-8"/>
   <title>M3U8 Recorder</title>
   <style>
-    body { font-family: sans-serif; max-width: 900px; margin: 30px auto; }
-    input { width: 80%; padding: 8px; }
+    body { font-family: sans-serif; max-width: 1100px; margin: 30px auto; }
+    input { width: 75%; padding: 8px; }
     button { padding: 8px 12px; margin-left: 6px; }
     pre { background:#f6f6f6; padding:12px; overflow:auto; }
+    table { width:100%; border-collapse: collapse; margin-top: 14px; }
+    th, td { border:1px solid #ddd; padding: 8px; text-align: left; font-size: 14px; }
+    th { background: #f7f7f7; }
+    .actions button { margin-left: 0; }
   </style>
 </head>
 <body>
-  <h2>M3U8 Recorder</h2>
+  <h2>M3U8 Recorder（多路并发）</h2>
   <div>
     <input id="url" placeholder="paste m3u8 url here" />
-    <button onclick="start()">Start</button>
-    <button onclick="stop()">Stop</button>
+    <button onclick="start()">添加录制</button>
+    <button onclick="stopAll()">全部停止</button>
   </div>
-  <h3>Status</h3>
+
+  <h3>房间状态（录制时长 / 录制速度）</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>URL</th>
+        <th>状态</th>
+        <th>录制时长</th>
+        <th>录制速度</th>
+        <th>分片数</th>
+        <th>累计流量</th>
+        <th>错误</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody id="rooms"></tbody>
+  </table>
+
+  <h3>原始状态 JSON</h3>
   <pre id="status">loading...</pre>
 
 <script>
+function formatDuration(sec) {
+  sec = Number(sec || 0);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  return [h, m, s].map(v => String(v).padStart(2, '0')).join(':');
+}
+
+function formatBytes(n) {
+  n = Number(n || 0);
+  if (n < 1024) return n.toFixed(0) + ' B';
+  if (n < 1024*1024) return (n/1024).toFixed(2) + ' KB';
+  if (n < 1024*1024*1024) return (n/1024/1024).toFixed(2) + ' MB';
+  return (n/1024/1024/1024).toFixed(2) + ' GB';
+}
+
+function renderRooms(rooms) {
+  const tbody = document.getElementById('rooms');
+  tbody.innerHTML = '';
+  if (!rooms || rooms.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8">暂无房间</td></tr>';
+    return;
+  }
+
+  rooms.forEach(room => {
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td>' + (room.url || '') + '</td>' +
+      '<td>' + (room.state || '') + '</td>' +
+      '<td>' + formatDuration(room.uptime_seconds) + '</td>' +
+      '<td>' + (room.speed_kb_per_s || 0).toFixed(2) + ' KB/s</td>' +
+      '<td>' + (room.segments_done || 0) + '</td>' +
+      '<td>' + formatBytes(room.bytes_done) + '</td>' +
+      '<td>' + (room.error || '') + '</td>' +
+      '<td class="actions"><button onclick="stopOneByUrl(this.dataset.url)" data-url="' + encodeURIComponent(room.url || '') + '">停止</button></td>';
+    tbody.appendChild(tr);
+  });
+}
+
 async function refresh() {
   const r = await fetch('/status');
-  document.getElementById('status').textContent = JSON.stringify(await r.json(), null, 2);
+  const data = await r.json();
+  renderRooms(data.rooms || []);
+  document.getElementById('status').textContent = JSON.stringify(data, null, 2);
 }
+
 async function start() {
   const url = document.getElementById('url').value.trim();
   const r = await fetch('/start', {
@@ -71,11 +135,24 @@ async function start() {
   alert((await r.json()).message);
   refresh();
 }
-async function stop() {
+
+async function stopOneByUrl(encodedURL) {
+  const url = decodeURIComponent(encodedURL || '');
+  const r = await fetch('/stop', {
+    method:'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({url})
+  });
+  alert((await r.json()).message);
+  refresh();
+}
+
+async function stopAll() {
   const r = await fetch('/stop', {method:'POST'});
   alert((await r.json()).message);
   refresh();
 }
+
 setInterval(refresh, 1000);
 refresh();
 </script>
@@ -116,8 +193,20 @@ func (w *WebUI) handleStop(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusMethodNotAllowed, map[string]any{"message": "method not allowed"})
 		return
 	}
-	if err := w.rec.Stop(); err != nil {
+
+	var req struct {
+		URL string `json:"url"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
+	if err := w.rec.Stop(req.URL); err != nil {
 		writeJSON(rw, http.StatusBadRequest, map[string]any{"message": err.Error()})
+		return
+	}
+	if req.URL == "" {
+		writeJSON(rw, http.StatusOK, map[string]any{"message": "stopping all rooms"})
 		return
 	}
 	writeJSON(rw, http.StatusOK, map[string]any{"message": "stopping"})
