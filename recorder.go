@@ -335,6 +335,9 @@ func fetchText(ctx context.Context, client *http.Client, url string, requestUA s
 	if requestUA != "" {
 		req.Header.Set("User-Agent", requestUA)
 	}
+	if requestUA != "" {
+		req.Header.Set("User-Agent", requestUA)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", "", 0, err
