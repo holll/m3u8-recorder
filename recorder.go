@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -262,6 +263,7 @@ func (r *Recorder) loop(ctx context.Context, m3u8URL string) {
 
 		playlistBody, err := fetchText(ctx, client, m3u8URL, r.requestUA)
 		if err != nil {
+			log.Printf("[room=%s] fetch playlist failed: %v", m3u8URL, err)
 			r.setError(m3u8URL, fmt.Errorf("fetch playlist: %w", err))
 			return
 		}
@@ -306,6 +308,7 @@ func (r *Recorder) loop(ctx context.Context, m3u8URL string) {
 
 			n, err := downloadFile(ctx, client, seg.URL, outPath, r.requestUA)
 			if err != nil {
+				log.Printf("[room=%s] download segment failed: seg=%s out=%s err=%v", m3u8URL, seg.URL, outPath, err)
 				r.setError(m3u8URL, fmt.Errorf("download segment: %w", err))
 				return
 			}
@@ -335,7 +338,8 @@ func fetchText(ctx context.Context, client *http.Client, url string, requestUA s
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return "", fmt.Errorf("http %d", resp.StatusCode)
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("http %d %s, content-type=%q, body=%q", resp.StatusCode, http.StatusText(resp.StatusCode), resp.Header.Get("Content-Type"), string(snippet))
 	}
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -358,7 +362,8 @@ func downloadFile(ctx context.Context, client *http.Client, url, outPath, reques
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return 0, fmt.Errorf("segment http %d", resp.StatusCode)
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return 0, fmt.Errorf("segment http %d %s, content-type=%q, body=%q", resp.StatusCode, http.StatusText(resp.StatusCode), resp.Header.Get("Content-Type"), string(snippet))
 	}
 
 	tmp := outPath + ".part"
