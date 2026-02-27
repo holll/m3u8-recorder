@@ -43,15 +43,17 @@ type roomRecorder struct {
 type Recorder struct {
 	downloadRoot string
 	splitEvery   time.Duration
+	requestUA    string
 
 	mu    sync.Mutex
 	rooms map[string]*roomRecorder
 }
 
-func NewRecorder(downloadRoot string, splitSeconds int) *Recorder {
+func NewRecorder(downloadRoot string, splitSeconds int, requestUA string) *Recorder {
 	return &Recorder{
 		downloadRoot: downloadRoot,
 		splitEvery:   time.Duration(splitSeconds) * time.Second,
+		requestUA:    requestUA,
 		rooms:        make(map[string]*roomRecorder),
 	}
 }
@@ -258,7 +260,7 @@ func (r *Recorder) loop(ctx context.Context, m3u8URL string) {
 		default:
 		}
 
-		playlistBody, err := fetchText(ctx, client, m3u8URL)
+		playlistBody, err := fetchText(ctx, client, m3u8URL, r.requestUA)
 		if err != nil {
 			r.setError(m3u8URL, fmt.Errorf("fetch playlist: %w", err))
 			return
@@ -302,7 +304,7 @@ func (r *Recorder) loop(ctx context.Context, m3u8URL string) {
 			name := seg.Filename()
 			outPath := filepath.Join(chunkDir, name)
 
-			n, err := downloadFile(ctx, client, seg.URL, outPath)
+			n, err := downloadFile(ctx, client, seg.URL, outPath, r.requestUA)
 			if err != nil {
 				r.setError(m3u8URL, fmt.Errorf("download segment: %w", err))
 				return
@@ -319,10 +321,13 @@ func (r *Recorder) loop(ctx context.Context, m3u8URL string) {
 	}
 }
 
-func fetchText(ctx context.Context, client *http.Client, url string) (string, error) {
+func fetchText(ctx context.Context, client *http.Client, url string, requestUA string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return "", err
+	}
+	if requestUA != "" {
+		req.Header.Set("User-Agent", requestUA)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -339,10 +344,13 @@ func fetchText(ctx context.Context, client *http.Client, url string) (string, er
 	return string(b), nil
 }
 
-func downloadFile(ctx context.Context, client *http.Client, url, outPath string) (int64, error) {
+func downloadFile(ctx context.Context, client *http.Client, url, outPath, requestUA string) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return 0, err
+	}
+	if requestUA != "" {
+		req.Header.Set("User-Agent", requestUA)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
