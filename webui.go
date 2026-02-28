@@ -57,6 +57,7 @@ var indexTpl = template.Must(template.New("index").Parse(`
     <button onclick="start()">添加录制</button>
     <button onclick="stopAll()">全部停止</button>
   </div>
+  <p id="schedule" style="color:#666; margin-top:8px;"></p>
 
   <h3>房间状态（录制时长 / 录制速度）</h3>
   <table>
@@ -113,9 +114,12 @@ function renderRooms(rooms) {
       error: '错误'
     };
     const stateText = stateTextMap[room.state] || (room.state || '');
-    const stopBtn = canStop
+    const canStart = !!room.can_start;
+    const actionBtn = canStop
       ? '<button onclick="stopOneByUrl(this.dataset.url)" data-url="' + encodeURIComponent(room.url || '') + '">停止</button>'
-      : '<button disabled>已停止</button>';
+      : (canStart
+          ? '<button onclick="startByUrl(this.dataset.url)" data-url="' + encodeURIComponent(room.url || '') + '">启动</button>'
+          : '<button disabled>处理中</button>');
     tr.innerHTML =
       '<td>' + (room.url || '') + '</td>' +
       '<td>' + stateText + '</td>' +
@@ -124,14 +128,25 @@ function renderRooms(rooms) {
       '<td>' + (room.segments_done || 0) + '</td>' +
       '<td>' + formatBytes(room.bytes_done) + '</td>' +
       '<td>' + (room.error || '') + '</td>' +
-      '<td class="actions">' + stopBtn + '</td>';
+      '<td class="actions">' + actionBtn + '</td>';
     tbody.appendChild(tr);
   });
+}
+
+function renderSchedule(data) {
+  const el = document.getElementById('schedule');
+  if (!data.schedule_enabled) {
+    el.textContent = '定时录制：未启用（全天可录制）';
+    return;
+  }
+  const phase = data.schedule_in_range ? '当前在录制时段' : '当前不在录制时段';
+  el.textContent = '定时录制：' + data.schedule_start + ' ~ ' + data.schedule_end + '（' + phase + '）';
 }
 
 async function refresh() {
   const r = await fetch('/status');
   const data = await r.json();
+  renderSchedule(data);
   renderRooms(data.rooms || []);
   document.getElementById('status').textContent = JSON.stringify(data, null, 2);
 }
@@ -151,6 +166,17 @@ async function stopOneByUrl(encodedURL) {
   const url = decodeURIComponent(encodedURL || '');
   const r = await fetch('/stop', {
     method:'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({url})
+  });
+  alert((await r.json()).message);
+  refresh();
+}
+
+async function startByUrl(encodedURL) {
+  const url = decodeURIComponent(encodedURL || '');
+  const r = await fetch('/start', {
+    method: 'POST',
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({url})
   });

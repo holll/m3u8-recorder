@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -44,7 +46,9 @@ type roomRecorder struct {
 	lastStatAt   time.Time
 	lastStatSize int64
 
-	sessionDir string
+	sessionDir  string
+	filePrefix  string
+	baseDirName string
 }
 
 type Recorder struct {
@@ -52,17 +56,28 @@ type Recorder struct {
 	splitEvery   time.Duration
 	requestUA    string
 
+	scheduleEnabled bool
+	scheduleStartM  int
+	scheduleEndM    int
+
 	mu    sync.Mutex
 	rooms map[string]*roomRecorder
 }
 
-func NewRecorder(downloadRoot string, splitSeconds int, requestUA string) *Recorder {
-	return &Recorder{
-		downloadRoot: downloadRoot,
-		splitEvery:   time.Duration(splitSeconds) * time.Second,
-		requestUA:    requestUA,
-		rooms:        make(map[string]*roomRecorder),
+func NewRecorder(downloadRoot string, splitSeconds int, requestUA string, scheduleStartM, scheduleEndM int, scheduleEnabled bool) *Recorder {
+	r := &Recorder{
+		downloadRoot:    downloadRoot,
+		splitEvery:      time.Duration(splitSeconds) * time.Second,
+		requestUA:       requestUA,
+		scheduleEnabled: scheduleEnabled,
+		scheduleStartM:  scheduleStartM,
+		scheduleEndM:    scheduleEndM,
+		rooms:           make(map[string]*roomRecorder),
 	}
+	if scheduleEnabled {
+		go r.scheduleLoop()
+	}
+	return r
 }
 
 type RoomStatus struct {
@@ -76,13 +91,18 @@ type RoomStatus struct {
 	SpeedBytesPerS  float64       `json:"speed_bytes_per_s"`
 	SpeedKBytesPerS float64       `json:"speed_kb_per_s"`
 	CanStop         bool          `json:"can_stop"`
+	CanStart        bool          `json:"can_start"`
 }
 
 type Status struct {
-	DownloadRoot string       `json:"download_root"`
-	SplitSeconds int          `json:"split_seconds"`
-	ActiveCount  int          `json:"active_count"`
-	Rooms        []RoomStatus `json:"rooms"`
+	DownloadRoot    string       `json:"download_root"`
+	SplitSeconds    int          `json:"split_seconds"`
+	ActiveCount     int          `json:"active_count"`
+	ScheduleEnabled bool         `json:"schedule_enabled"`
+	ScheduleStart   string       `json:"schedule_start"`
+	ScheduleEnd     string       `json:"schedule_end"`
+	ScheduleInRange bool         `json:"schedule_in_range"`
+	Rooms           []RoomStatus `json:"rooms"`
 }
 
 func (r *Recorder) GetStatus() Status {
@@ -123,6 +143,7 @@ func (r *Recorder) GetStatus() Status {
 			SpeedBytesPerS:  speed,
 			SpeedKBytesPerS: speed / 1024,
 			CanStop:         room.state == StateRunning || room.state == StateStopping,
+			CanStart:        room.state == StateIdle || room.state == StateError,
 		})
 	}
 
@@ -131,10 +152,14 @@ func (r *Recorder) GetStatus() Status {
 	})
 
 	return Status{
-		DownloadRoot: r.downloadRoot,
-		SplitSeconds: int(r.splitEvery.Seconds()),
-		ActiveCount:  active,
-		Rooms:        rooms,
+		DownloadRoot:    r.downloadRoot,
+		SplitSeconds:    int(r.splitEvery.Seconds()),
+		ActiveCount:     active,
+		ScheduleEnabled: r.scheduleEnabled,
+		ScheduleStart:   minutesToHHMM(r.scheduleStartM),
+		ScheduleEnd:     minutesToHHMM(r.scheduleEndM),
+		ScheduleInRange: !r.scheduleEnabled || inScheduleWindow(time.Now(), r.scheduleStartM, r.scheduleEndM),
+		Rooms:           rooms,
 	}
 }
 
@@ -145,32 +170,56 @@ func (r *Recorder) Start(m3u8URL string) error {
 	if m3u8URL == "" {
 		return errors.New("m3u8 url is empty")
 	}
-	if room, ok := r.rooms[m3u8URL]; ok {
+
+	room, ok := r.rooms[m3u8URL]
+	if ok {
 		if room.state == StateRunning || room.state == StateStopping {
 			return errors.New("this room is already running")
 		}
+	} else {
+		room = &roomRecorder{url: m3u8URL}
+		r.rooms[m3u8URL] = room
 	}
 
-	sessionID := shortHash(m3u8URL)
-	sessionDir := filepath.Join(r.downloadRoot, time.Now().Format("20060102_150405")+"_"+sessionID)
-	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
-		return fmt.Errorf("mkdir session dir: %w", err)
+	if err := r.startRoomLocked(room); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *Recorder) startRoomLocked(room *roomRecorder) error {
+	if room == nil || room.url == "" {
+		return errors.New("room url is empty")
+	}
+	if room.state == StateRunning || room.state == StateStopping {
+		return errors.New("this room is already running")
 	}
 
-	room := &roomRecorder{
-		state:      StateRunning,
-		lastErr:    "",
-		url:        m3u8URL,
-		startedAt:  time.Now(),
-		stoppedAt:  time.Time{},
-		sessionDir: sessionDir,
+	baseDirName := roomBaseName(room.url)
+	baseDir := filepath.Join(r.downloadRoot, baseDirName)
+	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir room dir: %w", err)
 	}
+
+	startTime := time.Now()
+	startStamp := startTime.Format("20060102_150405")
+
+	room.state = StateRunning
+	room.lastErr = ""
+	room.startedAt = startTime
+	room.stoppedAt = time.Time{}
+	room.segmentsDone = 0
+	room.bytesDone = 0
+	room.speedBps = 0
+	room.lastStatAt = time.Time{}
+	room.lastStatSize = 0
+	room.sessionDir = baseDir
+	room.filePrefix = startStamp + "_"
+	room.baseDirName = baseDirName
 	room.runCtx, room.cancelRun = context.WithCancel(context.Background())
-	r.rooms[m3u8URL] = room
 
-	go r.runFFmpeg(room.runCtx, m3u8URL, sessionDir)
-	go r.monitorStats(room.runCtx, m3u8URL, sessionDir)
-
+	go r.runFFmpeg(room.runCtx, room.url, room.sessionDir, room.filePrefix)
+	go r.monitorStats(room.runCtx, room.url, room.sessionDir, room.filePrefix)
 	return nil
 }
 
@@ -260,8 +309,8 @@ func (r *Recorder) setStats(url string, segCount, totalBytes int64) {
 	room.lastStatSize = totalBytes
 }
 
-func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir string) {
-	segmentPattern := filepath.Join(sessionDir, "chunk_%06d.ts")
+func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir, filePrefix string) {
+	segmentPattern := filepath.Join(sessionDir, filePrefix+"%06d.ts")
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "warning",
@@ -285,7 +334,7 @@ func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir string) {
 		r.setError(m3u8URL, fmt.Errorf("start ffmpeg: %w", err))
 		return
 	}
-	log.Printf("[room=%s] ffmpeg started pid=%d output=%s", m3u8URL, cmd.Process.Pid, sessionDir)
+	log.Printf("[room=%s] ffmpeg started pid=%d output=%s pattern=%s", m3u8URL, cmd.Process.Pid, sessionDir, filepath.Base(segmentPattern))
 
 	var lastErrLines []string
 	scanner := bufio.NewScanner(stderr)
@@ -323,7 +372,7 @@ func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir string) {
 	r.setIdle(m3u8URL)
 }
 
-func (r *Recorder) monitorStats(ctx context.Context, m3u8URL, dir string) {
+func (r *Recorder) monitorStats(ctx context.Context, m3u8URL, dir, prefix string) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -333,15 +382,19 @@ func (r *Recorder) monitorStats(ctx context.Context, m3u8URL, dir string) {
 			r.setIdle(m3u8URL)
 			return
 		case <-ticker.C:
-			segCount, totalBytes := scanDirStats(dir)
+			segCount, totalBytes := scanDirStats(dir, prefix)
 			r.setStats(m3u8URL, segCount, totalBytes)
 		}
 	}
 }
 
-func scanDirStats(dir string) (segCount int64, totalBytes int64) {
+func scanDirStats(dir, prefix string) (segCount int64, totalBytes int64) {
 	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if prefix != "" && !strings.HasPrefix(name, prefix) {
 			return nil
 		}
 		info, statErr := d.Info()
@@ -349,12 +402,101 @@ func scanDirStats(dir string) (segCount int64, totalBytes int64) {
 			return nil
 		}
 		totalBytes += info.Size()
-		if strings.HasSuffix(strings.ToLower(d.Name()), ".ts") {
+		if strings.HasSuffix(strings.ToLower(name), ".ts") {
 			segCount++
 		}
 		return nil
 	})
 	return
+}
+
+func (r *Recorder) scheduleLoop() {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		r.applyScheduleOnce(time.Now())
+		<-ticker.C
+	}
+}
+
+func (r *Recorder) applyScheduleOnce(now time.Time) {
+	if !r.scheduleEnabled {
+		return
+	}
+	inWindow := inScheduleWindow(now, r.scheduleStartM, r.scheduleEndM)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, room := range r.rooms {
+		if inWindow {
+			if room.state == StateIdle {
+				if err := r.startRoomLocked(room); err != nil {
+					room.state = StateError
+					room.lastErr = "auto start failed: " + err.Error()
+					room.stoppedAt = time.Now()
+					room.speedBps = 0
+				}
+			}
+			continue
+		}
+
+		if room.state == StateRunning {
+			room.state = StateStopping
+			if room.cancelRun != nil {
+				room.cancelRun()
+			}
+		}
+	}
+}
+
+func inScheduleWindow(now time.Time, startM, endM int) bool {
+	if startM == endM {
+		return true
+	}
+	cur := now.Hour()*60 + now.Minute()
+	if startM < endM {
+		return cur >= startM && cur < endM
+	}
+	return cur >= startM || cur < endM
+}
+
+func minutesToHHMM(m int) string {
+	if m < 0 {
+		m = 0
+	}
+	m = m % (24 * 60)
+	hh := m / 60
+	mm := m % 60
+	return fmt.Sprintf("%02d:%02d", hh, mm)
+}
+
+func roomBaseName(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err == nil {
+		b := strings.TrimSpace(path.Base(strings.TrimSuffix(u.Path, "/")))
+		if b != "" && b != "." && b != "/" {
+			return sanitizeName(b)
+		}
+		if host := sanitizeName(u.Hostname()); host != "" {
+			return host
+		}
+	}
+	return "room_" + shortHash(rawURL)
+}
+
+func sanitizeName(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	replacer := strings.NewReplacer("/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_")
+	s = replacer.Replace(s)
+	s = strings.Trim(s, " .")
+	if s == "" {
+		return ""
+	}
+	return s
 }
 
 func shortHash(s string) string {
