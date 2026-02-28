@@ -485,7 +485,7 @@ func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir, filePrefi
 	}
 
 	waitErr := cmd.Wait()
-	if ctx.Err() == context.Canceled {
+	if errors.Is(ctx.Err(), context.Canceled) {
 		r.convertReadyTS(ctx, m3u8URL, sessionDir, filePrefix, false)
 		r.setIdle(m3u8URL)
 		log.Printf("[room=%s] ffmpeg stopped by user", m3u8URL)
@@ -556,7 +556,7 @@ func (r *Recorder) convertReadyTS(ctx context.Context, m3u8URL, dir, prefix stri
 			log.Printf("[room=%s] convert %s -> %s failed: %v", m3u8URL, filepath.Base(tsPath), filepath.Base(mp4Path), err)
 			continue
 		}
-		os.Remove(tsPath)
+		_ = os.Remove(tsPath)
 		log.Printf("[room=%s] converted %s -> %s", m3u8URL, filepath.Base(tsPath), filepath.Base(mp4Path))
 	}
 }
