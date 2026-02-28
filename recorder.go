@@ -78,10 +78,48 @@ func NewRecorder(downloadRoot string, splitSeconds int, requestUA string, schedu
 		rooms:           make(map[string]*roomRecorder),
 	}
 	r.loadRooms()
+	r.convertExistingTSOnStartup()
 	if scheduleEnabled {
 		go r.scheduleLoop()
 	}
 	return r
+}
+
+func (r *Recorder) convertExistingTSOnStartup() {
+	tsFiles := make([]string, 0, 128)
+	_ = filepath.WalkDir(r.downloadRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(strings.ToLower(d.Name()), ".ts") {
+			return nil
+		}
+		tsFiles = append(tsFiles, path)
+		return nil
+	})
+
+	if len(tsFiles) == 0 {
+		return
+	}
+
+	sort.Strings(tsFiles)
+	log.Printf("startup scan found %d ts files, converting...", len(tsFiles))
+
+	converted := 0
+	for _, tsPath := range tsFiles {
+		mp4Path := strings.TrimSuffix(tsPath, filepath.Ext(tsPath)) + ".mp4"
+		if _, err := os.Stat(mp4Path); err == nil {
+			continue
+		}
+		if err := remuxTS2MP4(context.Background(), tsPath, mp4Path); err != nil {
+			log.Printf("startup convert %s -> %s failed: %v", filepath.Base(tsPath), filepath.Base(mp4Path), err)
+			continue
+		}
+		_ = os.Remove(tsPath)
+		converted++
+	}
+
+	log.Printf("startup ts conversion finished: %d/%d converted", converted, len(tsFiles))
 }
 
 type RoomStatus struct {
