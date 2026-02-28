@@ -8,11 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"io"
-	"log"
-	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -40,10 +39,16 @@ type roomRecorder struct {
 	url string
 
 	startedAt    time.Time
+	stoppedAt    time.Time
 	segmentsDone int64
 	bytesDone    int64
+	speedBps     float64
+	lastStatAt   time.Time
+	lastStatSize int64
 
-	sessionDir string
+	sessionDir  string
+	filePrefix  string
+	baseDirName string
 }
 
 type Recorder struct {
@@ -51,29 +56,28 @@ type Recorder struct {
 	splitEvery   time.Duration
 	requestUA    string
 
-	mu    sync.Mutex
-	rooms map[string]*roomRecorder
-}
-
-	seen map[string]struct{}
-}
-
-type Recorder struct {
-	downloadRoot string
-	splitEvery   time.Duration
-	requestUA    string
+	scheduleEnabled bool
+	scheduleStartM  int
+	scheduleEndM    int
 
 	mu    sync.Mutex
 	rooms map[string]*roomRecorder
 }
 
-func NewRecorder(downloadRoot string, splitSeconds int, requestUA string) *Recorder {
-	return &Recorder{
-		downloadRoot: downloadRoot,
-		splitEvery:   time.Duration(splitSeconds) * time.Second,
-		requestUA:    requestUA,
-		rooms:        make(map[string]*roomRecorder),
+func NewRecorder(downloadRoot string, splitSeconds int, requestUA string, scheduleStartM, scheduleEndM int, scheduleEnabled bool) *Recorder {
+	r := &Recorder{
+		downloadRoot:    downloadRoot,
+		splitEvery:      time.Duration(splitSeconds) * time.Second,
+		requestUA:       requestUA,
+		scheduleEnabled: scheduleEnabled,
+		scheduleStartM:  scheduleStartM,
+		scheduleEndM:    scheduleEndM,
+		rooms:           make(map[string]*roomRecorder),
 	}
+	if scheduleEnabled {
+		go r.scheduleLoop()
+	}
+	return r
 }
 
 type RoomStatus struct {
@@ -86,13 +90,19 @@ type RoomStatus struct {
 	UptimeSeconds   int64         `json:"uptime_seconds"`
 	SpeedBytesPerS  float64       `json:"speed_bytes_per_s"`
 	SpeedKBytesPerS float64       `json:"speed_kb_per_s"`
+	CanStop         bool          `json:"can_stop"`
+	CanStart        bool          `json:"can_start"`
 }
 
 type Status struct {
-	DownloadRoot string       `json:"download_root"`
-	SplitSeconds int          `json:"split_seconds"`
-	ActiveCount  int          `json:"active_count"`
-	Rooms        []RoomStatus `json:"rooms"`
+	DownloadRoot    string       `json:"download_root"`
+	SplitSeconds    int          `json:"split_seconds"`
+	ActiveCount     int          `json:"active_count"`
+	ScheduleEnabled bool         `json:"schedule_enabled"`
+	ScheduleStart   string       `json:"schedule_start"`
+	ScheduleEnd     string       `json:"schedule_end"`
+	ScheduleInRange bool         `json:"schedule_in_range"`
+	Rooms           []RoomStatus `json:"rooms"`
 }
 
 func (r *Recorder) GetStatus() Status {
@@ -106,11 +116,18 @@ func (r *Recorder) GetStatus() Status {
 		var uptime int64
 		if !room.startedAt.IsZero() {
 			started = room.startedAt.Format(time.RFC3339)
-			uptime = int64(time.Since(room.startedAt).Seconds())
+			endAt := time.Now()
+			if (room.state == StateIdle || room.state == StateError) && !room.stoppedAt.IsZero() {
+				endAt = room.stoppedAt
+			}
+			uptime = int64(endAt.Sub(room.startedAt).Seconds())
+			if uptime < 0 {
+				uptime = 0
+			}
 		}
-		speed := 0.0
-		if uptime > 0 {
-			speed = float64(room.bytesDone) / float64(uptime)
+		speed := room.speedBps
+		if room.state != StateRunning && room.state != StateStopping {
+			speed = 0
 		}
 		if room.state == StateRunning {
 			active++
@@ -125,6 +142,8 @@ func (r *Recorder) GetStatus() Status {
 			UptimeSeconds:   uptime,
 			SpeedBytesPerS:  speed,
 			SpeedKBytesPerS: speed / 1024,
+			CanStop:         room.state == StateRunning || room.state == StateStopping,
+			CanStart:        room.state == StateIdle || room.state == StateError,
 		})
 	}
 
@@ -133,10 +152,14 @@ func (r *Recorder) GetStatus() Status {
 	})
 
 	return Status{
-		DownloadRoot: r.downloadRoot,
-		SplitSeconds: int(r.splitEvery.Seconds()),
-		ActiveCount:  active,
-		Rooms:        rooms,
+		DownloadRoot:    r.downloadRoot,
+		SplitSeconds:    int(r.splitEvery.Seconds()),
+		ActiveCount:     active,
+		ScheduleEnabled: r.scheduleEnabled,
+		ScheduleStart:   minutesToHHMM(r.scheduleStartM),
+		ScheduleEnd:     minutesToHHMM(r.scheduleEndM),
+		ScheduleInRange: !r.scheduleEnabled || inScheduleWindow(time.Now(), r.scheduleStartM, r.scheduleEndM),
+		Rooms:           rooms,
 	}
 }
 
@@ -147,37 +170,56 @@ func (r *Recorder) Start(m3u8URL string) error {
 	if m3u8URL == "" {
 		return errors.New("m3u8 url is empty")
 	}
-	if room, ok := r.rooms[m3u8URL]; ok {
+
+	room, ok := r.rooms[m3u8URL]
+	if ok {
 		if room.state == StateRunning || room.state == StateStopping {
 			return errors.New("this room is already running")
 		}
+	} else {
+		room = &roomRecorder{url: m3u8URL}
+		r.rooms[m3u8URL] = room
 	}
 
-	sessionID := shortHash(m3u8URL)
-	sessionDir := filepath.Join(r.downloadRoot, time.Now().Format("20060102_150405")+"_"+sessionID)
-	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
-		return fmt.Errorf("mkdir session dir: %w", err)
+	if err := r.startRoomLocked(room); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *Recorder) startRoomLocked(room *roomRecorder) error {
+	if room == nil || room.url == "" {
+		return errors.New("room url is empty")
+	}
+	if room.state == StateRunning || room.state == StateStopping {
+		return errors.New("this room is already running")
 	}
 
-	room := &roomRecorder{
-		state:      StateRunning,
-		lastErr:    "",
-		url:        m3u8URL,
-		startedAt:  time.Now(),
-		sessionDir: sessionDir,
-	room := &roomRecorder{
-		state:     StateRunning,
-		lastErr:   "",
-		url:       m3u8URL,
-		startedAt: time.Now(),
-		seen:      make(map[string]struct{}),
+	baseDirName := roomBaseName(room.url)
+	baseDir := filepath.Join(r.downloadRoot, baseDirName)
+	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir room dir: %w", err)
 	}
+
+	startTime := time.Now()
+	startStamp := startTime.Format("20060102_150405")
+
+	room.state = StateRunning
+	room.lastErr = ""
+	room.startedAt = startTime
+	room.stoppedAt = time.Time{}
+	room.segmentsDone = 0
+	room.bytesDone = 0
+	room.speedBps = 0
+	room.lastStatAt = time.Time{}
+	room.lastStatSize = 0
+	room.sessionDir = baseDir
+	room.filePrefix = startStamp + "_"
+	room.baseDirName = baseDirName
 	room.runCtx, room.cancelRun = context.WithCancel(context.Background())
-	r.rooms[m3u8URL] = room
 
-	go r.runFFmpeg(room.runCtx, m3u8URL, sessionDir)
-	go r.loop(room.runCtx, m3u8URL)
-
+	go r.runFFmpeg(room.runCtx, room.url, room.sessionDir, room.filePrefix)
+	go r.monitorStats(room.runCtx, room.url, room.sessionDir, room.filePrefix)
 	return nil
 }
 
@@ -225,6 +267,8 @@ func (r *Recorder) setError(url string, err error) {
 	}
 	room.state = StateError
 	room.lastErr = err.Error()
+	room.stoppedAt = time.Now()
+	room.speedBps = 0
 }
 
 func (r *Recorder) setIdle(url string) {
@@ -235,10 +279,13 @@ func (r *Recorder) setIdle(url string) {
 		return
 	}
 	room.state = StateIdle
+	if room.stoppedAt.IsZero() {
+		room.stoppedAt = time.Now()
+	}
+	room.speedBps = 0
 }
 
 func (r *Recorder) setStats(url string, segCount, totalBytes int64) {
-func (r *Recorder) incStats(url string, segBytes int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	room, ok := r.rooms[url]
@@ -247,12 +294,23 @@ func (r *Recorder) incStats(url string, segBytes int64) {
 	}
 	room.segmentsDone = segCount
 	room.bytesDone = totalBytes
+	now := time.Now()
+	if !room.lastStatAt.IsZero() {
+		dt := now.Sub(room.lastStatAt).Seconds()
+		if dt > 0 {
+			delta := totalBytes - room.lastStatSize
+			if delta < 0 {
+				delta = 0
+			}
+			room.speedBps = float64(delta) / dt
+		}
+	}
+	room.lastStatAt = now
+	room.lastStatSize = totalBytes
 }
 
-func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir string) {
-	go r.monitorStats(ctx, m3u8URL, sessionDir)
-
-	segmentPattern := filepath.Join(sessionDir, "chunk_%06d.ts")
+func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir, filePrefix string) {
+	segmentPattern := filepath.Join(sessionDir, filePrefix+"%06d.ts")
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "warning",
@@ -263,27 +321,7 @@ func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir string) {
 		"-segment_time", strconv.Itoa(int(r.splitEvery.Seconds())),
 		"-reset_timestamps", "1",
 		segmentPattern,
-	room.segmentsDone++
-	room.bytesDone += segBytes
-}
-
-func (r *Recorder) markSeen(url string, segKey string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	room, ok := r.rooms[url]
-	if !ok {
-		return false
 	}
-	_, exists := room.seen[segKey]
-	if exists {
-		return false
-	}
-	room.seen[segKey] = struct{}{}
-	return true
-}
-
-func (r *Recorder) loop(ctx context.Context, m3u8URL string) {
-	client := &http.Client{Timeout: 20 * time.Second}
 
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	stderr, err := cmd.StderrPipe()
@@ -296,7 +334,7 @@ func (r *Recorder) loop(ctx context.Context, m3u8URL string) {
 		r.setError(m3u8URL, fmt.Errorf("start ffmpeg: %w", err))
 		return
 	}
-	log.Printf("[room=%s] ffmpeg started pid=%d output=%s", m3u8URL, cmd.Process.Pid, sessionDir)
+	log.Printf("[room=%s] ffmpeg started pid=%d output=%s pattern=%s", m3u8URL, cmd.Process.Pid, sessionDir, filepath.Base(segmentPattern))
 
 	var lastErrLines []string
 	scanner := bufio.NewScanner(stderr)
@@ -334,90 +372,9 @@ func (r *Recorder) loop(ctx context.Context, m3u8URL string) {
 	r.setIdle(m3u8URL)
 }
 
-func (r *Recorder) monitorStats(ctx context.Context, m3u8URL, dir string) {
+func (r *Recorder) monitorStats(ctx context.Context, m3u8URL, dir, prefix string) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-	sessionID := shortHash(m3u8URL)
-	sessionDir := filepath.Join(r.downloadRoot, time.Now().Format("20060102_150405")+"_"+sessionID)
-	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
-		r.setError(m3u8URL, fmt.Errorf("mkdir session dir: %w", err))
-		return
-	}
-
-	chunkStart := time.Now()
-	chunkIndex := 1
-	chunkDir := filepath.Join(sessionDir, fmt.Sprintf("chunk_%04d", chunkIndex))
-	if err := os.MkdirAll(chunkDir, 0o755); err != nil {
-		r.setError(m3u8URL, fmt.Errorf("mkdir chunk dir: %w", err))
-		return
-	}
-
-	pollEvery := 2 * time.Second
-
-	for {
-		select {
-		case <-ctx.Done():
-			r.setIdle(m3u8URL)
-			return
-		default:
-		}
-
-		playlistBody, finalPlaylistURL, statusCode, err := fetchText(ctx, client, m3u8URL, r.requestUA)
-		if err != nil {
-			log.Printf("[room=%s] fetch playlist failed: status=%d final_url=%s err=%v", m3u8URL, statusCode, finalPlaylistURL, err)
-			r.setError(m3u8URL, fmt.Errorf("fetch playlist: %w", err))
-			return
-		}
-		if finalPlaylistURL != "" && finalPlaylistURL != m3u8URL {
-			log.Printf("[room=%s] playlist redirected: %s -> %s (status=%d)", m3u8URL, m3u8URL, finalPlaylistURL, statusCode)
-		}
-
-		pl, err := ParseM3U8(finalPlaylistURL, playlistBody)
-		if err != nil {
-			r.setError(m3u8URL, fmt.Errorf("parse playlist: %w", err))
-			return
-		}
-		if pl.TargetDuration > 0 {
-			pollEvery = time.Duration(pl.TargetDuration) * time.Second / 2
-			if pollEvery < 1*time.Second {
-				pollEvery = 1 * time.Second
-			}
-			if pollEvery > 10*time.Second {
-				pollEvery = 10 * time.Second
-			}
-		}
-
-		if time.Since(chunkStart) >= r.splitEvery {
-			chunkIndex++
-			chunkStart = time.Now()
-			chunkDir = filepath.Join(sessionDir, fmt.Sprintf("chunk_%04d", chunkIndex))
-			if err := os.MkdirAll(chunkDir, 0o755); err != nil {
-				r.setError(m3u8URL, fmt.Errorf("mkdir chunk dir: %w", err))
-				return
-			}
-		}
-
-		for _, seg := range pl.Segments {
-			segKey := seg.URL
-			if segKey == "" {
-				continue
-			}
-
-			if !r.markSeen(m3u8URL, segKey) {
-				continue
-			}
-
-			name := seg.Filename()
-			outPath := filepath.Join(chunkDir, name)
-
-			n, err := downloadFile(ctx, client, seg.URL, outPath, r.requestUA)
-			if err != nil {
-				log.Printf("[room=%s] download segment failed: seg=%s out=%s err=%v", m3u8URL, seg.URL, outPath, err)
-				r.setError(m3u8URL, fmt.Errorf("download segment: %w", err))
-				return
-			}
-			r.incStats(m3u8URL, n)
-		}
 
 	for {
 		select {
@@ -425,15 +382,19 @@ func (r *Recorder) monitorStats(ctx context.Context, m3u8URL, dir string) {
 			r.setIdle(m3u8URL)
 			return
 		case <-ticker.C:
-			segCount, totalBytes := scanDirStats(dir)
+			segCount, totalBytes := scanDirStats(dir, prefix)
 			r.setStats(m3u8URL, segCount, totalBytes)
 		}
 	}
 }
 
-func scanDirStats(dir string) (segCount int64, totalBytes int64) {
+func scanDirStats(dir, prefix string) (segCount int64, totalBytes int64) {
 	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if prefix != "" && !strings.HasPrefix(name, prefix) {
 			return nil
 		}
 		info, statErr := d.Info()
@@ -441,79 +402,101 @@ func scanDirStats(dir string) (segCount int64, totalBytes int64) {
 			return nil
 		}
 		totalBytes += info.Size()
-		if strings.HasSuffix(strings.ToLower(d.Name()), ".ts") {
+		if strings.HasSuffix(strings.ToLower(name), ".ts") {
 			segCount++
 		}
 		return nil
 	})
 	return
-func fetchText(ctx context.Context, client *http.Client, url string, requestUA string) (body string, finalURL string, statusCode int, err error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return "", "", 0, err
-	}
-	if requestUA != "" {
-		req.Header.Set("User-Agent", requestUA)
-	}
-	if requestUA != "" {
-		req.Header.Set("User-Agent", requestUA)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", "", 0, err
-	}
-	defer resp.Body.Close()
-	resolvedURL := url
-	if resp.Request != nil && resp.Request.URL != nil {
-		resolvedURL = resp.Request.URL.String()
-	}
-	if resp.StatusCode/100 != 2 {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return "", resolvedURL, resp.StatusCode, fmt.Errorf("http %d %s, content-type=%q, body=%q", resp.StatusCode, http.StatusText(resp.StatusCode), resp.Header.Get("Content-Type"), string(snippet))
-	}
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", resolvedURL, resp.StatusCode, err
-	}
-	return string(b), resolvedURL, resp.StatusCode, nil
 }
 
-func downloadFile(ctx context.Context, client *http.Client, url, outPath, requestUA string) (int64, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return 0, err
+func (r *Recorder) scheduleLoop() {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		r.applyScheduleOnce(time.Now())
+		<-ticker.C
 	}
-	if requestUA != "" {
-		req.Header.Set("User-Agent", requestUA)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return 0, fmt.Errorf("segment http %d %s, content-type=%q, body=%q", resp.StatusCode, http.StatusText(resp.StatusCode), resp.Header.Get("Content-Type"), string(snippet))
-	}
+}
 
-	tmp := outPath + ".part"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return 0, err
+func (r *Recorder) applyScheduleOnce(now time.Time) {
+	if !r.scheduleEnabled {
+		return
 	}
-	defer f.Close()
+	inWindow := inScheduleWindow(now, r.scheduleStartM, r.scheduleEndM)
 
-	n, err := io.Copy(f, resp.Body)
-	if err != nil {
-		return 0, err
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, room := range r.rooms {
+		if inWindow {
+			if room.state == StateIdle {
+				if err := r.startRoomLocked(room); err != nil {
+					room.state = StateError
+					room.lastErr = "auto start failed: " + err.Error()
+					room.stoppedAt = time.Now()
+					room.speedBps = 0
+				}
+			}
+			continue
+		}
+
+		if room.state == StateRunning {
+			room.state = StateStopping
+			if room.cancelRun != nil {
+				room.cancelRun()
+			}
+		}
 	}
-	if err := f.Close(); err != nil {
-		return 0, err
+}
+
+func inScheduleWindow(now time.Time, startM, endM int) bool {
+	if startM == endM {
+		return true
 	}
-	if err := os.Rename(tmp, outPath); err != nil {
-		return 0, err
+	cur := now.Hour()*60 + now.Minute()
+	if startM < endM {
+		return cur >= startM && cur < endM
 	}
-	return n, nil
+	return cur >= startM || cur < endM
+}
+
+func minutesToHHMM(m int) string {
+	if m < 0 {
+		m = 0
+	}
+	m = m % (24 * 60)
+	hh := m / 60
+	mm := m % 60
+	return fmt.Sprintf("%02d:%02d", hh, mm)
+}
+
+func roomBaseName(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err == nil {
+		b := strings.TrimSpace(path.Base(strings.TrimSuffix(u.Path, "/")))
+		if b != "" && b != "." && b != "/" {
+			return sanitizeName(b)
+		}
+		if host := sanitizeName(u.Hostname()); host != "" {
+			return host
+		}
+	}
+	return "room_" + shortHash(rawURL)
+}
+
+func sanitizeName(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	replacer := strings.NewReplacer("/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_")
+	s = replacer.Replace(s)
+	s = strings.Trim(s, " .")
+	if s == "" {
+		return ""
+	}
+	return s
 }
 
 func shortHash(s string) string {
