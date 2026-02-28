@@ -448,6 +448,7 @@ func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir, filePrefi
 
 	waitErr := cmd.Wait()
 	if ctx.Err() == context.Canceled {
+		r.convertReadyTS(ctx, m3u8URL, sessionDir, filePrefix, false)
 		r.setIdle(m3u8URL)
 		log.Printf("[room=%s] ffmpeg stopped by user", m3u8URL)
 		return
@@ -465,6 +466,7 @@ func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir, filePrefi
 		return
 	}
 
+	r.convertReadyTS(ctx, m3u8URL, sessionDir, filePrefix, false)
 	r.setIdle(m3u8URL)
 }
 
@@ -480,8 +482,71 @@ func (r *Recorder) monitorStats(ctx context.Context, m3u8URL, dir, prefix string
 		case <-ticker.C:
 			segCount, totalBytes := scanDirStats(dir, prefix)
 			r.setStats(m3u8URL, segCount, totalBytes)
+			r.convertReadyTS(ctx, m3u8URL, dir, prefix, true)
 		}
 	}
+}
+
+func (r *Recorder) convertReadyTS(ctx context.Context, m3u8URL, dir, prefix string, skipNewest bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+
+	tsFiles := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(strings.ToLower(name), ".ts") {
+			continue
+		}
+		tsFiles = append(tsFiles, filepath.Join(dir, name))
+	}
+	sort.Strings(tsFiles)
+	if skipNewest && len(tsFiles) > 0 {
+		tsFiles = tsFiles[:len(tsFiles)-1]
+	}
+
+	for _, tsPath := range tsFiles {
+		mp4Path := strings.TrimSuffix(tsPath, filepath.Ext(tsPath)) + ".mp4"
+		if _, err := os.Stat(mp4Path); err == nil {
+			continue
+		}
+		if err := remuxTS2MP4(ctx, tsPath, mp4Path); err != nil {
+			log.Printf("[room=%s] convert %s -> %s failed: %v", m3u8URL, filepath.Base(tsPath), filepath.Base(mp4Path), err)
+			continue
+		}
+		log.Printf("[room=%s] converted %s -> %s", m3u8URL, filepath.Base(tsPath), filepath.Base(mp4Path))
+	}
+}
+
+func remuxTS2MP4(ctx context.Context, tsPath, mp4Path string) error {
+	tmpOut := mp4Path + ".tmp"
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-nostdin",
+		"-hide_banner",
+		"-loglevel", "error",
+		"-y",
+		"-i", tsPath,
+		"-c", "copy",
+		"-bsf:a", "aac_adtstoasc",
+		tmpOut,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		_ = os.Remove(tmpOut)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("ffmpeg remux failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	if err := os.Rename(tmpOut, mp4Path); err != nil {
+		_ = os.Remove(tmpOut)
+		return fmt.Errorf("rename output: %w", err)
+	}
+	return nil
 }
 
 func scanDirStats(dir, prefix string) (segCount int64, totalBytes int64) {
