@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -53,6 +54,7 @@ type roomRecorder struct {
 
 type Recorder struct {
 	downloadRoot string
+	roomsFile    string
 	splitEvery   time.Duration
 	requestUA    string
 
@@ -67,6 +69,7 @@ type Recorder struct {
 func NewRecorder(downloadRoot string, splitSeconds int, requestUA string, scheduleStartM, scheduleEndM int, scheduleEnabled bool) *Recorder {
 	r := &Recorder{
 		downloadRoot:    downloadRoot,
+		roomsFile:       filepath.Join(downloadRoot, "rooms.json"),
 		splitEvery:      time.Duration(splitSeconds) * time.Second,
 		requestUA:       requestUA,
 		scheduleEnabled: scheduleEnabled,
@@ -74,6 +77,7 @@ func NewRecorder(downloadRoot string, splitSeconds int, requestUA string, schedu
 		scheduleEndM:    scheduleEndM,
 		rooms:           make(map[string]*roomRecorder),
 	}
+	r.loadRooms()
 	if scheduleEnabled {
 		go r.scheduleLoop()
 	}
@@ -104,6 +108,77 @@ type Status struct {
 	ScheduleEnd     string       `json:"schedule_end"`
 	ScheduleInRange bool         `json:"schedule_in_range"`
 	Rooms           []RoomStatus `json:"rooms"`
+}
+
+func (r *Recorder) loadRooms() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if err := os.MkdirAll(r.downloadRoot, 0o755); err != nil {
+		log.Printf("create download root failed: %v", err)
+		return
+	}
+
+	b, err := os.ReadFile(r.roomsFile)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		log.Printf("read rooms file failed: %v", err)
+		return
+	}
+
+	var urls []string
+	if err := json.Unmarshal(b, &urls); err != nil {
+		log.Printf("parse rooms file failed: %v", err)
+		return
+	}
+
+	loaded := 0
+	for _, raw := range urls {
+		u := strings.TrimSpace(raw)
+		if u == "" {
+			continue
+		}
+		if _, exists := r.rooms[u]; exists {
+			continue
+		}
+		r.rooms[u] = &roomRecorder{
+			url:   u,
+			state: StateIdle,
+		}
+		loaded++
+	}
+	if loaded > 0 {
+		log.Printf("loaded %d rooms from %s", loaded, r.roomsFile)
+	}
+}
+
+func (r *Recorder) saveRoomsLocked() error {
+	urls := make([]string, 0, len(r.rooms))
+	for u := range r.rooms {
+		urls = append(urls, u)
+	}
+	sort.Strings(urls)
+
+	b, err := json.MarshalIndent(urls, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal rooms: %w", err)
+	}
+	b = append(b, '\n')
+
+	if err := os.MkdirAll(r.downloadRoot, 0o755); err != nil {
+		return fmt.Errorf("create download root: %w", err)
+	}
+
+	tmp := r.roomsFile + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return fmt.Errorf("write rooms temp file: %w", err)
+	}
+	if err := os.Rename(tmp, r.roomsFile); err != nil {
+		return fmt.Errorf("rename rooms file: %w", err)
+	}
+	return nil
 }
 
 func (r *Recorder) GetStatus() Status {
@@ -178,6 +253,10 @@ func (r *Recorder) AddRoom(m3u8URL string) error {
 	r.rooms[m3u8URL] = &roomRecorder{
 		url:   m3u8URL,
 		state: StateIdle,
+	}
+	if err := r.saveRoomsLocked(); err != nil {
+		delete(r.rooms, m3u8URL)
+		return err
 	}
 	return nil
 }
