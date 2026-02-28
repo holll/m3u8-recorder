@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -53,6 +54,7 @@ type roomRecorder struct {
 
 type Recorder struct {
 	downloadRoot string
+	persistFile  string
 	splitEvery   time.Duration
 	requestUA    string
 
@@ -60,8 +62,16 @@ type Recorder struct {
 	scheduleStartM  int
 	scheduleEndM    int
 
-	mu    sync.Mutex
-	rooms map[string]*roomRecorder
+	for _, raw := range urls {
+		u := strings.TrimSpace(raw)
+		if u == "" {
+			continue
+		}
+		if _, exists := r.rooms[u]; exists {
+			continue
+		}
+		r.rooms[u] = &roomRecorder{url: u, state: StateIdle}
+	}
 }
 
 func NewRecorder(downloadRoot string, splitSeconds int, requestUA string, scheduleStartM, scheduleEndM int, scheduleEnabled bool) *Recorder {
@@ -362,6 +372,7 @@ func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir, filePrefi
 			if consecutiveFailures >= 8 {
 				r.setError(m3u8URL, fmt.Errorf("start ffmpeg after %d retries: %w", consecutiveFailures, err))
 				return
+			case <-time.After(wait):
 			}
 			wait := retryBackoff(consecutiveFailures)
 			log.Printf("[room=%s] start ffmpeg failed (attempt=%d): %v; retry in %s", m3u8URL, consecutiveFailures, err, wait)
