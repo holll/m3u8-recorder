@@ -81,6 +81,7 @@ func NewRecorder(downloadRoot string, splitSeconds int, requestUA string, schedu
 }
 
 type RoomStatus struct {
+	RoomBaseName    string        `json:"room_base_name"`
 	State           RecorderState `json:"state"`
 	Error           string        `json:"error"`
 	URL             string        `json:"url"`
@@ -133,6 +134,7 @@ func (r *Recorder) GetStatus() Status {
 			active++
 		}
 		rooms = append(rooms, RoomStatus{
+			RoomBaseName:    roomBaseName(room.url),
 			State:           room.state,
 			Error:           room.lastErr,
 			URL:             room.url,
@@ -163,6 +165,23 @@ func (r *Recorder) GetStatus() Status {
 	}
 }
 
+func (r *Recorder) AddRoom(m3u8URL string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if m3u8URL == "" {
+		return errors.New("m3u8 url is empty")
+	}
+	if _, ok := r.rooms[m3u8URL]; ok {
+		return errors.New("room already exists")
+	}
+	r.rooms[m3u8URL] = &roomRecorder{
+		url:   m3u8URL,
+		state: StateIdle,
+	}
+	return nil
+}
+
 func (r *Recorder) Start(m3u8URL string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -172,13 +191,11 @@ func (r *Recorder) Start(m3u8URL string) error {
 	}
 
 	room, ok := r.rooms[m3u8URL]
-	if ok {
-		if room.state == StateRunning || room.state == StateStopping {
-			return errors.New("this room is already running")
-		}
-	} else {
-		room = &roomRecorder{url: m3u8URL}
-		r.rooms[m3u8URL] = room
+	if !ok {
+		return errors.New("room not found, please add room first")
+	}
+	if room.state == StateRunning || room.state == StateStopping {
+		return errors.New("this room is already running")
 	}
 
 	if err := r.startRoomLocked(room); err != nil {
