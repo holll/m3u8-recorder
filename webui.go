@@ -40,25 +40,110 @@ var indexTpl = template.Must(template.New("index").Parse(`
   <meta charset="utf-8"/>
   <title>M3U8 Recorder</title>
   <style>
-    body { font-family: sans-serif; max-width: 1100px; margin: 30px auto; }
-    input { width: 75%; padding: 8px; }
-    button { padding: 8px 12px; margin-left: 6px; }
-    pre { background:#f6f6f6; padding:12px; overflow:auto; }
-    table { width:100%; border-collapse: collapse; margin-top: 14px; }
-    th, td { border:1px solid #ddd; padding: 8px; text-align: left; font-size: 14px; }
-    th { background: #f7f7f7; }
-    .actions button { margin-left: 0; }
+    :root {
+      --bg: #f4f7fb;
+      --card: #ffffff;
+      --line: #e5ebf3;
+      --text: #243046;
+      --sub: #6a7890;
+      --primary: #3d7bff;
+      --danger: #e85a5a;
+      --success: #1aa772;
+      --idle: #8a93a5;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: linear-gradient(180deg, #f8fbff 0%, var(--bg) 100%);
+      color: var(--text);
+    }
+    .container { max-width: 1180px; margin: 24px auto; padding: 0 16px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: 0 8px 26px rgba(36, 48, 70, 0.06);
+      padding: 16px;
+      margin-bottom: 14px;
+    }
+    h2, h3 { margin: 0; }
+    h2 { font-size: 22px; }
+    h3 { font-size: 16px; color: var(--sub); font-weight: 600; }
+    .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+    input {
+      flex: 1 1 580px;
+      min-width: 220px;
+      padding: 10px 12px;
+      border: 1px solid #d5deea;
+      border-radius: 10px;
+      outline: none;
+      font-size: 14px;
+    }
+    input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(61,123,255,.15); }
+    button {
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      color: white;
+      background: var(--primary);
+      cursor: pointer;
+    }
+    button:hover { filter: brightness(0.95); }
+    button:disabled { cursor: not-allowed; background: #aeb8c8; }
+    .btn-danger { background: var(--danger); }
+    .btn-ghost { background: #7182a0; }
+    .meta { color: var(--sub); margin-top: 8px; font-size: 13px; }
+    .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+    .chip {
+      background: #edf3ff;
+      color: #345089;
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    table { width:100%; border-collapse: collapse; margin-top: 12px; }
+    th, td { border-bottom:1px solid var(--line); padding: 10px 8px; text-align: left; font-size: 13px; vertical-align: top; }
+    th { color: var(--sub); font-weight: 600; }
+    tr:hover td { background: #fafcff; }
+    .url-cell { max-width: 360px; word-break: break-all; }
+    .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+    .status {
+      display: inline-block;
+      font-size: 12px;
+      font-weight: 600;
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: #eef1f6;
+      color: var(--idle);
+    }
+    .status-running { background: rgba(26,167,114,.12); color: var(--success); }
+    .status-stopping { background: rgba(232,90,90,.12); color: #cc4a4a; }
+    .status-error { background: rgba(232,90,90,.12); color: #c83d3d; }
   </style>
 </head>
 <body>
-  <h2>M3U8 Recorder（多路并发）</h2>
-  <div>
-    <input id="url" placeholder="paste m3u8 url here" />
-    <button onclick="start()">添加录制</button>
-    <button onclick="stopAll()">全部停止</button>
+  <div class="container">
+  <div class="card">
+    <h2>M3U8 Recorder（多路并发）</h2>
+    <div class="toolbar">
+      <input id="url" placeholder="粘贴 m3u8 直播流地址" />
+      <button onclick="start()">添加录制</button>
+      <button class="btn-danger" onclick="stopAll()">全部停止</button>
+    </div>
+    <p id="schedule" class="meta"></p>
+    <div class="chips">
+      <span class="chip" id="statRooms">房间数：0</span>
+      <span class="chip" id="statActive">录制中：0</span>
+      <span class="chip" id="statTotalBytes">累计流量：0 B</span>
+    </div>
   </div>
   <p id="schedule" style="color:#666; margin-top:8px;"></p>
 
+  <div class="card">
   <h3>房间状态（录制时长 / 录制速度）</h3>
   <table>
     <thead>
@@ -75,9 +160,8 @@ var indexTpl = template.Must(template.New("index").Parse(`
     </thead>
     <tbody id="rooms"></tbody>
   </table>
-
-  <h3>原始状态 JSON</h3>
-  <pre id="status">loading...</pre>
+  </div>
+  </div>
 
 <script>
 function formatDuration(sec) {
@@ -148,7 +232,6 @@ async function refresh() {
   const data = await r.json();
   renderSchedule(data);
   renderRooms(data.rooms || []);
-  document.getElementById('status').textContent = JSON.stringify(data, null, 2);
 }
 
 async function start() {

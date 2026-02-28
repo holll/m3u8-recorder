@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -53,6 +54,7 @@ type roomRecorder struct {
 
 type Recorder struct {
 	downloadRoot string
+	persistFile  string
 	splitEvery   time.Duration
 	requestUA    string
 
@@ -60,8 +62,30 @@ type Recorder struct {
 	scheduleStartM  int
 	scheduleEndM    int
 
-	mu    sync.Mutex
-	rooms map[string]*roomRecorder
+	content, err := os.ReadFile(r.persistFile)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("load persisted rooms failed: %v", err)
+		}
+		return
+	}
+
+	var urls []string
+	if err := json.Unmarshal(content, &urls); err != nil {
+		log.Printf("decode persisted rooms failed: %v", err)
+		return
+	}
+
+	for _, raw := range urls {
+		u := strings.TrimSpace(raw)
+		if u == "" {
+			continue
+		}
+		if _, exists := r.rooms[u]; exists {
+			continue
+		}
+		r.rooms[u] = &roomRecorder{url: u, state: StateIdle}
+	}
 }
 
 func NewRecorder(downloadRoot string, splitSeconds int, requestUA string, scheduleStartM, scheduleEndM int, scheduleEnabled bool) *Recorder {
