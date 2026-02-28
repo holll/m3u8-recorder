@@ -518,12 +518,13 @@ func (r *Recorder) convertReadyTS(ctx context.Context, m3u8URL, dir, prefix stri
 			log.Printf("[room=%s] convert %s -> %s failed: %v", m3u8URL, filepath.Base(tsPath), filepath.Base(mp4Path), err)
 			continue
 		}
+		os.Remove(tsPath)
 		log.Printf("[room=%s] converted %s -> %s", m3u8URL, filepath.Base(tsPath), filepath.Base(mp4Path))
 	}
 }
 
 func remuxTS2MP4(ctx context.Context, tsPath, mp4Path string) error {
-	tmpOut := mp4Path + ".tmp"
+	tmpOut := mp4Path
 	cmd := exec.CommandContext(ctx, "ffmpeg",
 		"-nostdin",
 		"-hide_banner",
