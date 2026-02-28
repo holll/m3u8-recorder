@@ -473,14 +473,26 @@ func minutesToHHMM(m int) string {
 
 func roomBaseName(rawURL string) string {
 	u, err := url.Parse(rawURL)
-	if err == nil {
-		b := strings.TrimSpace(path.Base(strings.TrimSuffix(u.Path, "/")))
-		if b != "" && b != "." && b != "/" {
-			return sanitizeName(b)
-		}
-		if host := sanitizeName(u.Hostname()); host != "" {
-			return host
-		}
+	if err != nil {
+		return "room_" + shortHash(rawURL)
+	}
+	q := u.Query()
+	id := strings.TrimSpace(q.Get("id"))
+	title := strings.TrimSpace(q.Get("title"))
+	if id != "" && title != "" {
+		return sanitizeName(id + "_" + title)
+	}
+	// 如果只有 id
+	if id != "" {
+		return sanitizeName(id)
+	}
+	// fallback 原有逻辑
+	b := strings.TrimSpace(path.Base(strings.TrimSuffix(u.Path, "/")))
+	if b != "" && b != "." && b != "/" {
+		return sanitizeName(b)
+	}
+	if host := sanitizeName(u.Hostname()); host != "" {
+		return host
 	}
 	return "room_" + shortHash(rawURL)
 }
