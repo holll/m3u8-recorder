@@ -141,6 +141,7 @@ var indexTpl = template.Must(template.New("index").Parse(`
       <span class="chip" id="statTotalBytes">累计流量：0 B</span>
     </div>
   </div>
+  <p id="schedule" style="color:#666; margin-top:8px;"></p>
 
   <div class="card">
   <h3>房间状态（录制时长 / 录制速度）</h3>
@@ -197,16 +198,15 @@ function renderRooms(rooms) {
       error: '错误'
     };
     const stateText = stateTextMap[room.state] || (room.state || '');
-    const stateClass = room.state ? ('status-' + room.state) : '';
     const canStart = !!room.can_start;
     const actionBtn = canStop
-      ? '<button class="btn-danger" onclick="stopOneByUrl(this.dataset.url)" data-url="' + encodeURIComponent(room.url || '') + '">停止</button>'
+      ? '<button onclick="stopOneByUrl(this.dataset.url)" data-url="' + encodeURIComponent(room.url || '') + '">停止</button>'
       : (canStart
           ? '<button onclick="startByUrl(this.dataset.url)" data-url="' + encodeURIComponent(room.url || '') + '">启动</button>'
-          : '<button class="btn-ghost" disabled>处理中</button>');
+          : '<button disabled>处理中</button>');
     tr.innerHTML =
-      '<td class="url-cell">' + (room.url || '') + '</td>' +
-      '<td><span class="status ' + stateClass + '">' + stateText + '</span></td>' +
+      '<td>' + (room.url || '') + '</td>' +
+      '<td>' + stateText + '</td>' +
       '<td>' + formatDuration(room.uptime_seconds) + '</td>' +
       '<td>' + (room.speed_kb_per_s || 0).toFixed(2) + ' KB/s</td>' +
       '<td>' + (room.segments_done || 0) + '</td>' +
@@ -215,15 +215,6 @@ function renderRooms(rooms) {
       '<td class="actions">' + actionBtn + '</td>';
     tbody.appendChild(tr);
   });
-}
-
-function renderSummary(data) {
-  const rooms = data.rooms || [];
-  let total = 0;
-  rooms.forEach(room => { total += Number(room.bytes_done || 0); });
-  document.getElementById('statRooms').textContent = '房间数：' + rooms.length;
-  document.getElementById('statActive').textContent = '录制中：' + Number(data.active_count || 0);
-  document.getElementById('statTotalBytes').textContent = '累计流量：' + formatBytes(total);
 }
 
 function renderSchedule(data) {
@@ -240,7 +231,6 @@ async function refresh() {
   const r = await fetch('/status');
   const data = await r.json();
   renderSchedule(data);
-  renderSummary(data);
   renderRooms(data.rooms || []);
 }
 

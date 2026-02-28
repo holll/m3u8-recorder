@@ -62,35 +62,6 @@ type Recorder struct {
 	scheduleStartM  int
 	scheduleEndM    int
 
-	mu    sync.Mutex
-	rooms map[string]*roomRecorder
-}
-
-func NewRecorder(downloadRoot string, splitSeconds int, requestUA string, scheduleStartM, scheduleEndM int, scheduleEnabled bool) *Recorder {
-	r := &Recorder{
-		downloadRoot:    downloadRoot,
-		persistFile:     filepath.Join(downloadRoot, "rooms.json"),
-		splitEvery:      time.Duration(splitSeconds) * time.Second,
-		requestUA:       requestUA,
-		scheduleEnabled: scheduleEnabled,
-		scheduleStartM:  scheduleStartM,
-		scheduleEndM:    scheduleEndM,
-		rooms:           make(map[string]*roomRecorder),
-	}
-	r.loadPersistedRooms()
-	if scheduleEnabled {
-		r.applyScheduleOnce(time.Now())
-	}
-	if scheduleEnabled {
-		go r.scheduleLoop()
-	}
-	return r
-}
-
-func (r *Recorder) loadPersistedRooms() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	content, err := os.ReadFile(r.persistFile)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
@@ -117,26 +88,20 @@ func (r *Recorder) loadPersistedRooms() {
 	}
 }
 
-func (r *Recorder) persistRoomsLocked() {
-	if err := os.MkdirAll(r.downloadRoot, 0o755); err != nil {
-		log.Printf("persist rooms mkdir failed: %v", err)
-		return
+func NewRecorder(downloadRoot string, splitSeconds int, requestUA string, scheduleStartM, scheduleEndM int, scheduleEnabled bool) *Recorder {
+	r := &Recorder{
+		downloadRoot:    downloadRoot,
+		splitEvery:      time.Duration(splitSeconds) * time.Second,
+		requestUA:       requestUA,
+		scheduleEnabled: scheduleEnabled,
+		scheduleStartM:  scheduleStartM,
+		scheduleEndM:    scheduleEndM,
+		rooms:           make(map[string]*roomRecorder),
 	}
-
-	urls := make([]string, 0, len(r.rooms))
-	for u := range r.rooms {
-		urls = append(urls, u)
+	if scheduleEnabled {
+		go r.scheduleLoop()
 	}
-	sort.Strings(urls)
-
-	data, err := json.MarshalIndent(urls, "", "  ")
-	if err != nil {
-		log.Printf("persist rooms marshal failed: %v", err)
-		return
-	}
-	if err := os.WriteFile(r.persistFile, data, 0o644); err != nil {
-		log.Printf("persist rooms write failed: %v", err)
-	}
+	return r
 }
 
 type RoomStatus struct {
@@ -238,7 +203,6 @@ func (r *Recorder) Start(m3u8URL string) error {
 	} else {
 		room = &roomRecorder{url: m3u8URL}
 		r.rooms[m3u8URL] = room
-		r.persistRoomsLocked()
 	}
 
 	if err := r.startRoomLocked(room); err != nil {
@@ -371,65 +335,153 @@ func (r *Recorder) setStats(url string, segCount, totalBytes int64) {
 
 func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir, filePrefix string) {
 	segmentPattern := filepath.Join(sessionDir, filePrefix+"%06d.ts")
-	args := []string{
-		"-hide_banner",
-		"-loglevel", "warning",
-		"-user_agent", r.requestUA,
-		"-i", m3u8URL,
-		"-c", "copy",
-		"-f", "segment",
-		"-segment_time", strconv.Itoa(int(r.splitEvery.Seconds())),
-		"-reset_timestamps", "1",
-		segmentPattern,
-	}
-
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		r.setError(m3u8URL, fmt.Errorf("ffmpeg stderr pipe: %w", err))
-		return
-	}
-
-	if err := cmd.Start(); err != nil {
-		r.setError(m3u8URL, fmt.Errorf("start ffmpeg: %w", err))
-		return
-	}
-	log.Printf("[room=%s] ffmpeg started pid=%d output=%s pattern=%s", m3u8URL, cmd.Process.Pid, sessionDir, filepath.Base(segmentPattern))
-
-	var lastErrLines []string
-	scanner := bufio.NewScanner(stderr)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		log.Printf("[room=%s] ffmpeg: %s", m3u8URL, line)
-		lastErrLines = append(lastErrLines, line)
-		if len(lastErrLines) > 8 {
-			lastErrLines = lastErrLines[1:]
-		}
-	}
-
-	waitErr := cmd.Wait()
-	if ctx.Err() == context.Canceled {
-		r.setIdle(m3u8URL)
-		log.Printf("[room=%s] ffmpeg stopped by user", m3u8URL)
-		return
-	}
-	if scanner.Err() != nil {
-		r.setError(m3u8URL, fmt.Errorf("read ffmpeg stderr: %w", scanner.Err()))
-		return
-	}
-	if waitErr != nil {
-		if len(lastErrLines) > 0 {
-			r.setError(m3u8URL, fmt.Errorf("ffmpeg exited: %v; last logs: %s", waitErr, strings.Join(lastErrLines, " | ")))
+	consecutiveFailures := 0
+	for {
+		if ctx.Err() == context.Canceled {
+			r.setIdle(m3u8URL)
+			log.Printf("[room=%s] ffmpeg stopped by user", m3u8URL)
 			return
 		}
-		r.setError(m3u8URL, fmt.Errorf("ffmpeg exited: %w", waitErr))
+
+		startNo := countExistingSegments(sessionDir, filePrefix) + 1
+		args := []string{
+			"-hide_banner",
+			"-loglevel", "warning",
+			"-user_agent", r.requestUA,
+			"-rw_timeout", "15000000",
+			"-i", m3u8URL,
+			"-c", "copy",
+			"-f", "segment",
+			"-segment_time", strconv.Itoa(int(r.splitEvery.Seconds())),
+			"-segment_start_number", strconv.FormatInt(startNo, 10),
+			"-reset_timestamps", "1",
+			segmentPattern,
+		}
+
+		cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+		stderr, err := cmd.StderrPipe()
+		if err != nil {
+			r.setError(m3u8URL, fmt.Errorf("ffmpeg stderr pipe: %w", err))
+			return
+		}
+
+		if err := cmd.Start(); err != nil {
+			consecutiveFailures++
+			if consecutiveFailures >= 8 {
+				r.setError(m3u8URL, fmt.Errorf("start ffmpeg after %d retries: %w", consecutiveFailures, err))
+				return
+			}
+			wait := retryBackoff(consecutiveFailures)
+			log.Printf("[room=%s] start ffmpeg failed (attempt=%d): %v; retry in %s", m3u8URL, consecutiveFailures, err, wait)
+			select {
+			case <-ctx.Done():
+				r.setIdle(m3u8URL)
+				return
+			case <-time.After(wait):
+			}
+			continue
+		}
+		log.Printf("[room=%s] ffmpeg started pid=%d output=%s pattern=%s start_no=%d", m3u8URL, cmd.Process.Pid, sessionDir, filepath.Base(segmentPattern), startNo)
+
+		var lastErrLines []string
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			log.Printf("[room=%s] ffmpeg: %s", m3u8URL, line)
+			lastErrLines = append(lastErrLines, line)
+			if len(lastErrLines) > 8 {
+				lastErrLines = lastErrLines[1:]
+			}
+		}
+
+		waitErr := cmd.Wait()
+		if ctx.Err() == context.Canceled {
+			r.setIdle(m3u8URL)
+			log.Printf("[room=%s] ffmpeg stopped by user", m3u8URL)
+			return
+		}
+		if scanner.Err() != nil {
+			consecutiveFailures++
+			if consecutiveFailures >= 8 {
+				r.setError(m3u8URL, fmt.Errorf("read ffmpeg stderr after %d retries: %w", consecutiveFailures, scanner.Err()))
+				return
+			}
+			wait := retryBackoff(consecutiveFailures)
+			log.Printf("[room=%s] ffmpeg stderr read failed: %v; retry in %s", m3u8URL, scanner.Err(), wait)
+			select {
+			case <-ctx.Done():
+				r.setIdle(m3u8URL)
+				return
+			case <-time.After(wait):
+			}
+			continue
+		}
+		if waitErr != nil {
+			consecutiveFailures++
+			if consecutiveFailures >= 8 {
+				if len(lastErrLines) > 0 {
+					r.setError(m3u8URL, fmt.Errorf("ffmpeg exited after %d retries: %v; last logs: %s", consecutiveFailures, waitErr, strings.Join(lastErrLines, " | ")))
+					return
+				}
+				r.setError(m3u8URL, fmt.Errorf("ffmpeg exited after %d retries: %w", consecutiveFailures, waitErr))
+				return
+			}
+			wait := retryBackoff(consecutiveFailures)
+			if len(lastErrLines) > 0 {
+				log.Printf("[room=%s] ffmpeg exited: %v; retry in %s; last logs: %s", m3u8URL, waitErr, wait, strings.Join(lastErrLines, " | "))
+			} else {
+				log.Printf("[room=%s] ffmpeg exited: %v; retry in %s", m3u8URL, waitErr, wait)
+			}
+			select {
+			case <-ctx.Done():
+				r.setIdle(m3u8URL)
+				return
+			case <-time.After(wait):
+			}
+			continue
+		}
+
+		// ffmpeg 正常结束（直播源主动结束）
+		r.setIdle(m3u8URL)
 		return
 	}
+}
 
-	r.setIdle(m3u8URL)
+func countExistingSegments(dir, prefix string) int64 {
+	var n int64
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if prefix != "" && !strings.HasPrefix(name, prefix) {
+			return nil
+		}
+		if strings.HasSuffix(strings.ToLower(name), ".ts") {
+			n++
+		}
+		return nil
+	})
+	return n
+}
+
+func retryBackoff(failures int) time.Duration {
+	if failures <= 1 {
+		return 2 * time.Second
+	}
+	if failures == 2 {
+		return 4 * time.Second
+	}
+	if failures == 3 {
+		return 8 * time.Second
+	}
+	if failures == 4 {
+		return 15 * time.Second
+	}
+	return 20 * time.Second
 }
 
 func (r *Recorder) monitorStats(ctx context.Context, m3u8URL, dir, prefix string) {
@@ -533,26 +585,14 @@ func minutesToHHMM(m int) string {
 
 func roomBaseName(rawURL string) string {
 	u, err := url.Parse(rawURL)
-	if err != nil {
-		return "room_" + shortHash(rawURL)
-	}
-	q := u.Query()
-	id := strings.TrimSpace(q.Get("id"))
-	title := strings.TrimSpace(q.Get("title"))
-	if id != "" && title != "" {
-		return sanitizeName(id + "_" + title)
-	}
-	// 如果只有 id
-	if id != "" {
-		return sanitizeName(id)
-	}
-	// fallback 原有逻辑
-	b := strings.TrimSpace(path.Base(strings.TrimSuffix(u.Path, "/")))
-	if b != "" && b != "." && b != "/" {
-		return sanitizeName(b)
-	}
-	if host := sanitizeName(u.Hostname()); host != "" {
-		return host
+	if err == nil {
+		b := strings.TrimSpace(path.Base(strings.TrimSuffix(u.Path, "/")))
+		if b != "" && b != "." && b != "/" {
+			return sanitizeName(b)
+		}
+		if host := sanitizeName(u.Hostname()); host != "" {
+			return host
+		}
 	}
 	return "room_" + shortHash(rawURL)
 }
