@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -53,6 +54,7 @@ type roomRecorder struct {
 
 type Recorder struct {
 	downloadRoot string
+	persistFile  string
 	splitEvery   time.Duration
 	requestUA    string
 
@@ -67,6 +69,7 @@ type Recorder struct {
 func NewRecorder(downloadRoot string, splitSeconds int, requestUA string, scheduleStartM, scheduleEndM int, scheduleEnabled bool) *Recorder {
 	r := &Recorder{
 		downloadRoot:    downloadRoot,
+		persistFile:     filepath.Join(downloadRoot, "rooms.json"),
 		splitEvery:      time.Duration(splitSeconds) * time.Second,
 		requestUA:       requestUA,
 		scheduleEnabled: scheduleEnabled,
@@ -74,10 +77,66 @@ func NewRecorder(downloadRoot string, splitSeconds int, requestUA string, schedu
 		scheduleEndM:    scheduleEndM,
 		rooms:           make(map[string]*roomRecorder),
 	}
+	r.loadPersistedRooms()
+	if scheduleEnabled {
+		r.applyScheduleOnce(time.Now())
+	}
 	if scheduleEnabled {
 		go r.scheduleLoop()
 	}
 	return r
+}
+
+func (r *Recorder) loadPersistedRooms() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	content, err := os.ReadFile(r.persistFile)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("load persisted rooms failed: %v", err)
+		}
+		return
+	}
+
+	var urls []string
+	if err := json.Unmarshal(content, &urls); err != nil {
+		log.Printf("decode persisted rooms failed: %v", err)
+		return
+	}
+
+	for _, raw := range urls {
+		u := strings.TrimSpace(raw)
+		if u == "" {
+			continue
+		}
+		if _, exists := r.rooms[u]; exists {
+			continue
+		}
+		r.rooms[u] = &roomRecorder{url: u, state: StateIdle}
+	}
+}
+
+func (r *Recorder) persistRoomsLocked() {
+	if err := os.MkdirAll(r.downloadRoot, 0o755); err != nil {
+		log.Printf("persist rooms mkdir failed: %v", err)
+		return
+	}
+
+	urls := make([]string, 0, len(r.rooms))
+	for u := range r.rooms {
+		urls = append(urls, u)
+	}
+	sort.Strings(urls)
+
+	data, err := json.MarshalIndent(urls, "", "  ")
+	if err != nil {
+		log.Printf("persist rooms marshal failed: %v", err)
+		return
+	}
+	if err := os.WriteFile(r.persistFile, data, 0o644); err != nil {
+		log.Printf("persist rooms write failed: %v", err)
+	}
 }
 
 type RoomStatus struct {
@@ -179,6 +238,7 @@ func (r *Recorder) Start(m3u8URL string) error {
 	} else {
 		room = &roomRecorder{url: m3u8URL}
 		r.rooms[m3u8URL] = room
+		r.persistRoomsLocked()
 	}
 
 	if err := r.startRoomLocked(room); err != nil {
