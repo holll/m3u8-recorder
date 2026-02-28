@@ -78,7 +78,8 @@ func NewRecorder(downloadRoot string, splitSeconds int, requestUA string, schedu
 		rooms:           make(map[string]*roomRecorder),
 	}
 	r.loadRooms()
-	r.convertExistingTSOnStartup()
+	go r.convertExistingTSOnStartup()
+	time.Sleep(5 * time.Second)
 	if scheduleEnabled {
 		go r.scheduleLoop()
 	}
