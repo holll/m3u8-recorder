@@ -28,6 +28,8 @@ const (
 	StateRunning  RecorderState = "running"
 	StateStopping RecorderState = "stopping"
 	StateError    RecorderState = "error"
+
+	minRoomStartInterval = 15 * time.Minute
 )
 
 type roomRecorder struct {
@@ -329,6 +331,12 @@ func (r *Recorder) startRoomLocked(room *roomRecorder) error {
 	if room.state == StateRunning || room.state == StateStopping {
 		return errors.New("this room is already running")
 	}
+	if !room.startedAt.IsZero() {
+		waitFor := minRoomStartInterval - time.Since(room.startedAt)
+		if waitFor > 0 {
+			return fmt.Errorf("room start is rate limited, retry after %s", waitFor.Round(time.Second))
+		}
+	}
 
 	baseDirName := roomBaseName(room.url)
 	baseDir := filepath.Join(r.downloadRoot, baseDirName)
@@ -353,8 +361,7 @@ func (r *Recorder) startRoomLocked(room *roomRecorder) error {
 	room.baseDirName = baseDirName
 	room.runCtx, room.cancelRun = context.WithCancel(context.Background())
 
-	go r.runFFmpeg(room.runCtx, room.url, room.sessionDir, room.filePrefix)
-	go r.monitorStats(room.runCtx, room.url, room.sessionDir, room.filePrefix)
+	go r.runRoom(room.runCtx, room.url, room.sessionDir)
 	return nil
 }
 
@@ -444,16 +451,38 @@ func (r *Recorder) setStats(url string, segCount, totalBytes int64) {
 	room.lastStatSize = totalBytes
 }
 
-func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir, filePrefix string) {
-	segmentPattern := filepath.Join(sessionDir, filePrefix+"%06d.ts")
+func (r *Recorder) runRoom(ctx context.Context, m3u8URL, sessionDir string) {
+	go r.monitorStats(ctx, m3u8URL, sessionDir, "")
+	err := r.runFFmpegOnce(ctx, m3u8URL, sessionDir)
+	if errors.Is(ctx.Err(), context.Canceled) {
+		r.setIdle(m3u8URL)
+		return
+	}
+	if err != nil {
+		r.setError(m3u8URL, err)
+		return
+	}
+	log.Printf("[room=%s] ffmpeg exited normally, stop recording", m3u8URL)
+	r.setIdle(m3u8URL)
+}
+
+func (r *Recorder) runFFmpegOnce(ctx context.Context, m3u8URL, sessionDir string) error {
+	segmentPattern := filepath.Join(sessionDir, "%Y%m%d_%H%M%S.ts")
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "warning",
+		"-fflags", "+discardcorrupt",
+		"-rw_timeout", "15000000",
+		"-reconnect", "1",
+		"-reconnect_streamed", "1",
+		"-reconnect_delay_max", "10",
+		"-http_persistent", "0",
 		"-user_agent", r.requestUA,
 		"-i", m3u8URL,
 		"-c", "copy",
 		"-f", "segment",
 		"-segment_time", strconv.Itoa(int(r.splitEvery.Seconds())),
+		"-strftime", "1",
 		"-reset_timestamps", "1",
 		segmentPattern,
 	}
@@ -461,13 +490,11 @@ func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir, filePrefi
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		r.setError(m3u8URL, fmt.Errorf("ffmpeg stderr pipe: %w", err))
-		return
+		return fmt.Errorf("ffmpeg stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		r.setError(m3u8URL, fmt.Errorf("start ffmpeg: %w", err))
-		return
+		return fmt.Errorf("start ffmpeg: %w", err)
 	}
 	log.Printf("[room=%s] ffmpeg started pid=%d output=%s pattern=%s", m3u8URL, cmd.Process.Pid, sessionDir, filepath.Base(segmentPattern))
 
@@ -487,26 +514,21 @@ func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir, filePrefi
 
 	waitErr := cmd.Wait()
 	if errors.Is(ctx.Err(), context.Canceled) {
-		r.convertReadyTS(ctx, m3u8URL, sessionDir, filePrefix, false)
-		r.setIdle(m3u8URL)
-		log.Printf("[room=%s] ffmpeg stopped by user", m3u8URL)
-		return
+		r.convertReadyTS(ctx, m3u8URL, sessionDir, "", false)
+		return nil
 	}
 	if scanner.Err() != nil {
-		r.setError(m3u8URL, fmt.Errorf("read ffmpeg stderr: %w", scanner.Err()))
-		return
+		return fmt.Errorf("read ffmpeg stderr: %w", scanner.Err())
 	}
 	if waitErr != nil {
 		if len(lastErrLines) > 0 {
-			r.setError(m3u8URL, fmt.Errorf("ffmpeg exited: %v; last logs: %s", waitErr, strings.Join(lastErrLines, " | ")))
-			return
+			return fmt.Errorf("ffmpeg exited: %v; last logs: %s", waitErr, strings.Join(lastErrLines, " | "))
 		}
-		r.setError(m3u8URL, fmt.Errorf("ffmpeg exited: %w", waitErr))
-		return
+		return fmt.Errorf("ffmpeg exited: %w", waitErr)
 	}
 
-	r.convertReadyTS(ctx, m3u8URL, sessionDir, filePrefix, false)
-	r.setIdle(m3u8URL)
+	r.convertReadyTS(ctx, m3u8URL, sessionDir, "", false)
+	return nil
 }
 
 func (r *Recorder) monitorStats(ctx context.Context, m3u8URL, dir, prefix string) {
@@ -516,7 +538,6 @@ func (r *Recorder) monitorStats(ctx context.Context, m3u8URL, dir, prefix string
 	for {
 		select {
 		case <-ctx.Done():
-			r.setIdle(m3u8URL)
 			return
 		case <-ticker.C:
 			segCount, totalBytes := scanDirStats(dir, prefix)
