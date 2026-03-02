@@ -485,7 +485,9 @@ func (r *Recorder) runRoom(ctx context.Context, m3u8URL, sessionDir string) {
 				r.setError(m3u8URL, err)
 				return
 			}
-			log.Printf("[room=%s] ffmpeg exited, restarting...", m3u8URL)
+			log.Printf("[room=%s] ffmpeg exited normally, stop recording", m3u8URL)
+			r.setIdle(m3u8URL)
+			return
 		case <-restartTimer.C:
 			restartByTimer = true
 			cancelCycle()
@@ -511,7 +513,6 @@ func (r *Recorder) runFFmpegOnce(ctx context.Context, m3u8URL, sessionDir, fileP
 		"-rw_timeout", "15000000",
 		"-reconnect", "1",
 		"-reconnect_streamed", "1",
-		"-reconnect_at_eof", "1",
 		"-reconnect_delay_max", "10",
 		"-http_persistent", "0",
 		"-user_agent", r.requestUA,
