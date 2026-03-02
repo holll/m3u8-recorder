@@ -353,8 +353,7 @@ func (r *Recorder) startRoomLocked(room *roomRecorder) error {
 	room.baseDirName = baseDirName
 	room.runCtx, room.cancelRun = context.WithCancel(context.Background())
 
-	go r.runFFmpeg(room.runCtx, room.url, room.sessionDir, room.filePrefix)
-	go r.monitorStats(room.runCtx, room.url, room.sessionDir, room.filePrefix)
+	go r.runRoom(room.runCtx, room.url, room.sessionDir)
 	return nil
 }
 
@@ -444,11 +443,78 @@ func (r *Recorder) setStats(url string, segCount, totalBytes int64) {
 	room.lastStatSize = totalBytes
 }
 
-func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir, filePrefix string) {
+func (r *Recorder) runRoom(ctx context.Context, m3u8URL, sessionDir string) {
+	for {
+		if ctx.Err() != nil {
+			r.setIdle(m3u8URL)
+			return
+		}
+
+		filePrefix := time.Now().Format("20060102_150405") + "_"
+		r.mu.Lock()
+		if room, ok := r.rooms[m3u8URL]; ok {
+			room.filePrefix = filePrefix
+		}
+		r.mu.Unlock()
+
+		cycleCtx, cancelCycle := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		go func(prefix string) {
+			done <- r.runFFmpegOnce(cycleCtx, m3u8URL, sessionDir, prefix)
+		}(filePrefix)
+		go r.monitorStats(cycleCtx, m3u8URL, sessionDir, filePrefix)
+
+		restartTimer := time.NewTimer(r.splitEvery)
+		restartByTimer := false
+
+		select {
+		case <-ctx.Done():
+			cancelCycle()
+			err := <-done
+			restartTimer.Stop()
+			if err != nil {
+				r.setError(m3u8URL, err)
+				return
+			}
+			r.setIdle(m3u8URL)
+			return
+		case err := <-done:
+			restartTimer.Stop()
+			cancelCycle()
+			if err != nil {
+				r.setError(m3u8URL, err)
+				return
+			}
+			log.Printf("[room=%s] ffmpeg exited normally, stop recording", m3u8URL)
+			r.setIdle(m3u8URL)
+			return
+		case <-restartTimer.C:
+			restartByTimer = true
+			cancelCycle()
+			err := <-done
+			if err != nil {
+				r.setError(m3u8URL, err)
+				return
+			}
+		}
+
+		if restartByTimer {
+			log.Printf("[room=%s] restart interval reached (%s), restarting ffmpeg", m3u8URL, r.splitEvery)
+		}
+	}
+}
+
+func (r *Recorder) runFFmpegOnce(ctx context.Context, m3u8URL, sessionDir, filePrefix string) error {
 	segmentPattern := filepath.Join(sessionDir, filePrefix+"%06d.ts")
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "warning",
+		"-fflags", "+discardcorrupt",
+		"-rw_timeout", "15000000",
+		"-reconnect", "1",
+		"-reconnect_streamed", "1",
+		"-reconnect_delay_max", "10",
+		"-http_persistent", "0",
 		"-user_agent", r.requestUA,
 		"-i", m3u8URL,
 		"-c", "copy",
@@ -461,13 +527,11 @@ func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir, filePrefi
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		r.setError(m3u8URL, fmt.Errorf("ffmpeg stderr pipe: %w", err))
-		return
+		return fmt.Errorf("ffmpeg stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		r.setError(m3u8URL, fmt.Errorf("start ffmpeg: %w", err))
-		return
+		return fmt.Errorf("start ffmpeg: %w", err)
 	}
 	log.Printf("[room=%s] ffmpeg started pid=%d output=%s pattern=%s", m3u8URL, cmd.Process.Pid, sessionDir, filepath.Base(segmentPattern))
 
@@ -488,25 +552,20 @@ func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir, filePrefi
 	waitErr := cmd.Wait()
 	if errors.Is(ctx.Err(), context.Canceled) {
 		r.convertReadyTS(ctx, m3u8URL, sessionDir, filePrefix, false)
-		r.setIdle(m3u8URL)
-		log.Printf("[room=%s] ffmpeg stopped by user", m3u8URL)
-		return
+		return nil
 	}
 	if scanner.Err() != nil {
-		r.setError(m3u8URL, fmt.Errorf("read ffmpeg stderr: %w", scanner.Err()))
-		return
+		return fmt.Errorf("read ffmpeg stderr: %w", scanner.Err())
 	}
 	if waitErr != nil {
 		if len(lastErrLines) > 0 {
-			r.setError(m3u8URL, fmt.Errorf("ffmpeg exited: %v; last logs: %s", waitErr, strings.Join(lastErrLines, " | ")))
-			return
+			return fmt.Errorf("ffmpeg exited: %v; last logs: %s", waitErr, strings.Join(lastErrLines, " | "))
 		}
-		r.setError(m3u8URL, fmt.Errorf("ffmpeg exited: %w", waitErr))
-		return
+		return fmt.Errorf("ffmpeg exited: %w", waitErr)
 	}
 
 	r.convertReadyTS(ctx, m3u8URL, sessionDir, filePrefix, false)
-	r.setIdle(m3u8URL)
+	return nil
 }
 
 func (r *Recorder) monitorStats(ctx context.Context, m3u8URL, dir, prefix string) {
@@ -516,7 +575,6 @@ func (r *Recorder) monitorStats(ctx context.Context, m3u8URL, dir, prefix string
 	for {
 		select {
 		case <-ctx.Done():
-			r.setIdle(m3u8URL)
 			return
 		case <-ticker.C:
 			segCount, totalBytes := scanDirStats(dir, prefix)
