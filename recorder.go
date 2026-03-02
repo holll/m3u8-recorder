@@ -28,6 +28,8 @@ const (
 	StateRunning  RecorderState = "running"
 	StateStopping RecorderState = "stopping"
 	StateError    RecorderState = "error"
+
+	minRoomStartInterval = 15 * time.Minute
 )
 
 type roomRecorder struct {
@@ -328,6 +330,12 @@ func (r *Recorder) startRoomLocked(room *roomRecorder) error {
 	}
 	if room.state == StateRunning || room.state == StateStopping {
 		return errors.New("this room is already running")
+	}
+	if !room.startedAt.IsZero() {
+		waitFor := minRoomStartInterval - time.Since(room.startedAt)
+		if waitFor > 0 {
+			return fmt.Errorf("room start is rate limited, retry after %s", waitFor.Round(time.Second))
+		}
 	}
 
 	baseDirName := roomBaseName(room.url)
