@@ -29,8 +29,16 @@ const (
 	StateStopping RecorderState = "stopping"
 	StateError    RecorderState = "error"
 
-	minRoomStartInterval = 15 * time.Minute
+	endlistRetryInterval = 15 * time.Minute
 )
+
+type startRateLimitError struct {
+	wait time.Duration
+}
+
+func (e startRateLimitError) Error() string {
+	return fmt.Sprintf("room start is rate limited, retry after %s", e.wait.Round(time.Second))
+}
 
 type roomRecorder struct {
 	state   RecorderState
@@ -41,13 +49,14 @@ type roomRecorder struct {
 
 	url string
 
-	startedAt    time.Time
-	stoppedAt    time.Time
-	segmentsDone int64
-	bytesDone    int64
-	speedBps     float64
-	lastStatAt   time.Time
-	lastStatSize int64
+	startedAt      time.Time
+	stoppedAt      time.Time
+	nextStartAfter time.Time
+	segmentsDone   int64
+	bytesDone      int64
+	speedBps       float64
+	lastStatAt     time.Time
+	lastStatSize   int64
 
 	sessionDir  string
 	filePrefix  string
@@ -318,23 +327,23 @@ func (r *Recorder) Start(m3u8URL string) error {
 		return errors.New("this room is already running")
 	}
 
-	if err := r.startRoomLocked(room); err != nil {
+	if err := r.startRoomLocked(room, true); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (r *Recorder) startRoomLocked(room *roomRecorder) error {
+func (r *Recorder) startRoomLocked(room *roomRecorder, ignoreCooldown bool) error {
 	if room == nil || room.url == "" {
 		return errors.New("room url is empty")
 	}
 	if room.state == StateRunning || room.state == StateStopping {
 		return errors.New("this room is already running")
 	}
-	if !room.startedAt.IsZero() {
-		waitFor := minRoomStartInterval - time.Since(room.startedAt)
+	if !ignoreCooldown && !room.nextStartAfter.IsZero() {
+		waitFor := time.Until(room.nextStartAfter)
 		if waitFor > 0 {
-			return fmt.Errorf("room start is rate limited, retry after %s", waitFor.Round(time.Second))
+			return startRateLimitError{wait: waitFor}
 		}
 	}
 
@@ -351,6 +360,7 @@ func (r *Recorder) startRoomLocked(room *roomRecorder) error {
 	room.lastErr = ""
 	room.startedAt = startTime
 	room.stoppedAt = time.Time{}
+	room.nextStartAfter = time.Time{}
 	room.segmentsDone = 0
 	room.bytesDone = 0
 	room.speedBps = 0
@@ -427,6 +437,22 @@ func (r *Recorder) setIdle(url string) {
 	room.speedBps = 0
 }
 
+func (r *Recorder) setIdleWithCooldown(url string, cooldown time.Duration, msg string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	room, ok := r.rooms[url]
+	if !ok {
+		return
+	}
+	room.state = StateIdle
+	room.stoppedAt = time.Now()
+	room.nextStartAfter = room.stoppedAt.Add(cooldown)
+	room.speedBps = 0
+	if msg != "" {
+		room.lastErr = msg
+	}
+}
+
 func (r *Recorder) setStats(url string, segCount, totalBytes int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -462,8 +488,8 @@ func (r *Recorder) runRoom(ctx context.Context, m3u8URL, sessionDir string) {
 		r.setError(m3u8URL, err)
 		return
 	}
-	log.Printf("[room=%s] ffmpeg exited normally, stop recording", m3u8URL)
-	r.setIdle(m3u8URL)
+	log.Printf("[room=%s] stream ended normally, delay next start for %s", m3u8URL, endlistRetryInterval)
+	r.setIdleWithCooldown(m3u8URL, endlistRetryInterval, "stream ended (EXT-X-ENDLIST), waiting before next retry")
 }
 
 func (r *Recorder) runFFmpegOnce(ctx context.Context, m3u8URL, sessionDir string) error {
@@ -652,8 +678,16 @@ func (r *Recorder) applyScheduleOnce(now time.Time) {
 
 	for _, room := range r.rooms {
 		if inWindow {
-			if room.state == StateIdle {
-				if err := r.startRoomLocked(room); err != nil {
+			if room.state == StateIdle || room.state == StateError {
+				if err := r.startRoomLocked(room, false); err != nil {
+					var rateErr startRateLimitError
+					if errors.As(err, &rateErr) {
+						room.state = StateIdle
+						room.lastErr = rateErr.Error()
+						room.stoppedAt = time.Now()
+						room.speedBps = 0
+						continue
+					}
 					room.state = StateError
 					room.lastErr = "auto start failed: " + err.Error()
 					room.stoppedAt = time.Now()
