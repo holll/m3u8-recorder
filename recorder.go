@@ -28,7 +28,17 @@ const (
 	StateRunning  RecorderState = "running"
 	StateStopping RecorderState = "stopping"
 	StateError    RecorderState = "error"
+
+	endlistRetryInterval = 15 * time.Minute
 )
+
+type startRateLimitError struct {
+	wait time.Duration
+}
+
+func (e startRateLimitError) Error() string {
+	return fmt.Sprintf("room start is rate limited, retry after %s", e.wait.Round(time.Second))
+}
 
 type roomRecorder struct {
 	state   RecorderState
@@ -39,13 +49,14 @@ type roomRecorder struct {
 
 	url string
 
-	startedAt    time.Time
-	stoppedAt    time.Time
-	segmentsDone int64
-	bytesDone    int64
-	speedBps     float64
-	lastStatAt   time.Time
-	lastStatSize int64
+	startedAt      time.Time
+	stoppedAt      time.Time
+	nextStartAfter time.Time
+	segmentsDone   int64
+	bytesDone      int64
+	speedBps       float64
+	lastStatAt     time.Time
+	lastStatSize   int64
 
 	sessionDir  string
 	filePrefix  string
@@ -316,18 +327,24 @@ func (r *Recorder) Start(m3u8URL string) error {
 		return errors.New("this room is already running")
 	}
 
-	if err := r.startRoomLocked(room); err != nil {
+	if err := r.startRoomLocked(room, true); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (r *Recorder) startRoomLocked(room *roomRecorder) error {
+func (r *Recorder) startRoomLocked(room *roomRecorder, ignoreCooldown bool) error {
 	if room == nil || room.url == "" {
 		return errors.New("room url is empty")
 	}
 	if room.state == StateRunning || room.state == StateStopping {
 		return errors.New("this room is already running")
+	}
+	if !ignoreCooldown && !room.nextStartAfter.IsZero() {
+		waitFor := time.Until(room.nextStartAfter)
+		if waitFor > 0 {
+			return startRateLimitError{wait: waitFor}
+		}
 	}
 
 	baseDirName := roomBaseName(room.url)
@@ -343,6 +360,7 @@ func (r *Recorder) startRoomLocked(room *roomRecorder) error {
 	room.lastErr = ""
 	room.startedAt = startTime
 	room.stoppedAt = time.Time{}
+	room.nextStartAfter = time.Time{}
 	room.segmentsDone = 0
 	room.bytesDone = 0
 	room.speedBps = 0
@@ -353,8 +371,7 @@ func (r *Recorder) startRoomLocked(room *roomRecorder) error {
 	room.baseDirName = baseDirName
 	room.runCtx, room.cancelRun = context.WithCancel(context.Background())
 
-	go r.runFFmpeg(room.runCtx, room.url, room.sessionDir, room.filePrefix)
-	go r.monitorStats(room.runCtx, room.url, room.sessionDir, room.filePrefix)
+	go r.runRoom(room.runCtx, room.url, room.sessionDir)
 	return nil
 }
 
@@ -420,6 +437,22 @@ func (r *Recorder) setIdle(url string) {
 	room.speedBps = 0
 }
 
+func (r *Recorder) setIdleWithCooldown(url string, cooldown time.Duration, msg string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	room, ok := r.rooms[url]
+	if !ok {
+		return
+	}
+	room.state = StateIdle
+	room.stoppedAt = time.Now()
+	room.nextStartAfter = room.stoppedAt.Add(cooldown)
+	room.speedBps = 0
+	if msg != "" {
+		room.lastErr = msg
+	}
+}
+
 func (r *Recorder) setStats(url string, segCount, totalBytes int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -444,16 +477,38 @@ func (r *Recorder) setStats(url string, segCount, totalBytes int64) {
 	room.lastStatSize = totalBytes
 }
 
-func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir, filePrefix string) {
-	segmentPattern := filepath.Join(sessionDir, filePrefix+"%06d.ts")
+func (r *Recorder) runRoom(ctx context.Context, m3u8URL, sessionDir string) {
+	go r.monitorStats(ctx, m3u8URL, sessionDir, "")
+	err := r.runFFmpegOnce(ctx, m3u8URL, sessionDir)
+	if errors.Is(ctx.Err(), context.Canceled) {
+		r.setIdle(m3u8URL)
+		return
+	}
+	if err != nil {
+		r.setError(m3u8URL, err)
+		return
+	}
+	log.Printf("[room=%s] stream ended normally, delay next start for %s", m3u8URL, endlistRetryInterval)
+	r.setIdleWithCooldown(m3u8URL, endlistRetryInterval, "stream ended (EXT-X-ENDLIST), waiting before next retry")
+}
+
+func (r *Recorder) runFFmpegOnce(ctx context.Context, m3u8URL, sessionDir string) error {
+	segmentPattern := filepath.Join(sessionDir, "%Y%m%d_%H%M%S.ts")
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "warning",
+		"-fflags", "+discardcorrupt",
+		"-rw_timeout", "15000000",
+		"-reconnect", "1",
+		"-reconnect_streamed", "1",
+		"-reconnect_delay_max", "10",
+		"-http_persistent", "0",
 		"-user_agent", r.requestUA,
 		"-i", m3u8URL,
 		"-c", "copy",
 		"-f", "segment",
 		"-segment_time", strconv.Itoa(int(r.splitEvery.Seconds())),
+		"-strftime", "1",
 		"-reset_timestamps", "1",
 		segmentPattern,
 	}
@@ -461,17 +516,16 @@ func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir, filePrefi
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		r.setError(m3u8URL, fmt.Errorf("ffmpeg stderr pipe: %w", err))
-		return
+		return fmt.Errorf("ffmpeg stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		r.setError(m3u8URL, fmt.Errorf("start ffmpeg: %w", err))
-		return
+		return fmt.Errorf("start ffmpeg: %w", err)
 	}
 	log.Printf("[room=%s] ffmpeg started pid=%d output=%s pattern=%s", m3u8URL, cmd.Process.Pid, sessionDir, filepath.Base(segmentPattern))
 
 	var lastErrLines []string
+	hadFatalInputErr := false
 	scanner := bufio.NewScanner(stderr)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -479,6 +533,12 @@ func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir, filePrefi
 			continue
 		}
 		log.Printf("[room=%s] ffmpeg: %s", m3u8URL, line)
+		lowerLine := strings.ToLower(line)
+		if strings.Contains(lowerLine, "error during demuxing") ||
+			strings.Contains(lowerLine, "failed to reload playlist") ||
+			strings.Contains(lowerLine, "error number -") {
+			hadFatalInputErr = true
+		}
 		lastErrLines = append(lastErrLines, line)
 		if len(lastErrLines) > 8 {
 			lastErrLines = lastErrLines[1:]
@@ -487,26 +547,24 @@ func (r *Recorder) runFFmpeg(ctx context.Context, m3u8URL, sessionDir, filePrefi
 
 	waitErr := cmd.Wait()
 	if errors.Is(ctx.Err(), context.Canceled) {
-		r.convertReadyTS(ctx, m3u8URL, sessionDir, filePrefix, false)
-		r.setIdle(m3u8URL)
-		log.Printf("[room=%s] ffmpeg stopped by user", m3u8URL)
-		return
+		r.convertReadyTS(ctx, m3u8URL, sessionDir, "", false)
+		return nil
 	}
 	if scanner.Err() != nil {
-		r.setError(m3u8URL, fmt.Errorf("read ffmpeg stderr: %w", scanner.Err()))
-		return
+		return fmt.Errorf("read ffmpeg stderr: %w", scanner.Err())
 	}
 	if waitErr != nil {
 		if len(lastErrLines) > 0 {
-			r.setError(m3u8URL, fmt.Errorf("ffmpeg exited: %v; last logs: %s", waitErr, strings.Join(lastErrLines, " | ")))
-			return
+			return fmt.Errorf("ffmpeg exited: %v; last logs: %s", waitErr, strings.Join(lastErrLines, " | "))
 		}
-		r.setError(m3u8URL, fmt.Errorf("ffmpeg exited: %w", waitErr))
-		return
+		return fmt.Errorf("ffmpeg exited: %w", waitErr)
+	}
+	if hadFatalInputErr {
+		return fmt.Errorf("ffmpeg exited with fatal input errors; last logs: %s", strings.Join(lastErrLines, " | "))
 	}
 
-	r.convertReadyTS(ctx, m3u8URL, sessionDir, filePrefix, false)
-	r.setIdle(m3u8URL)
+	r.convertReadyTS(ctx, m3u8URL, sessionDir, "", false)
+	return nil
 }
 
 func (r *Recorder) monitorStats(ctx context.Context, m3u8URL, dir, prefix string) {
@@ -516,7 +574,6 @@ func (r *Recorder) monitorStats(ctx context.Context, m3u8URL, dir, prefix string
 	for {
 		select {
 		case <-ctx.Done():
-			r.setIdle(m3u8URL)
 			return
 		case <-ticker.C:
 			segCount, totalBytes := scanDirStats(dir, prefix)
@@ -631,8 +688,16 @@ func (r *Recorder) applyScheduleOnce(now time.Time) {
 
 	for _, room := range r.rooms {
 		if inWindow {
-			if room.state == StateIdle {
-				if err := r.startRoomLocked(room); err != nil {
+			if room.state == StateIdle || room.state == StateError {
+				if err := r.startRoomLocked(room, false); err != nil {
+					var rateErr startRateLimitError
+					if errors.As(err, &rateErr) {
+						room.state = StateIdle
+						room.lastErr = rateErr.Error()
+						room.stoppedAt = time.Now()
+						room.speedBps = 0
+						continue
+					}
 					room.state = StateError
 					room.lastErr = "auto start failed: " + err.Error()
 					room.stoppedAt = time.Now()
