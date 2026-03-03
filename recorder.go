@@ -525,6 +525,7 @@ func (r *Recorder) runFFmpegOnce(ctx context.Context, m3u8URL, sessionDir string
 	log.Printf("[room=%s] ffmpeg started pid=%d output=%s pattern=%s", m3u8URL, cmd.Process.Pid, sessionDir, filepath.Base(segmentPattern))
 
 	var lastErrLines []string
+	hadFatalInputErr := false
 	scanner := bufio.NewScanner(stderr)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -532,6 +533,12 @@ func (r *Recorder) runFFmpegOnce(ctx context.Context, m3u8URL, sessionDir string
 			continue
 		}
 		log.Printf("[room=%s] ffmpeg: %s", m3u8URL, line)
+		lowerLine := strings.ToLower(line)
+		if strings.Contains(lowerLine, "error during demuxing") ||
+			strings.Contains(lowerLine, "failed to reload playlist") ||
+			strings.Contains(lowerLine, "error number -") {
+			hadFatalInputErr = true
+		}
 		lastErrLines = append(lastErrLines, line)
 		if len(lastErrLines) > 8 {
 			lastErrLines = lastErrLines[1:]
@@ -551,6 +558,9 @@ func (r *Recorder) runFFmpegOnce(ctx context.Context, m3u8URL, sessionDir string
 			return fmt.Errorf("ffmpeg exited: %v; last logs: %s", waitErr, strings.Join(lastErrLines, " | "))
 		}
 		return fmt.Errorf("ffmpeg exited: %w", waitErr)
+	}
+	if hadFatalInputErr {
+		return fmt.Errorf("ffmpeg exited with fatal input errors; last logs: %s", strings.Join(lastErrLines, " | "))
 	}
 
 	r.convertReadyTS(ctx, m3u8URL, sessionDir, "", false)
