@@ -31,6 +31,7 @@ func (w *WebUI) routes() {
 	w.mux.HandleFunc("/add", w.handleAdd)
 	w.mux.HandleFunc("/start", w.handleStart)
 	w.mux.HandleFunc("/stop", w.handleStop)
+	w.mux.HandleFunc("/delete", w.handleDelete)
 	w.mux.HandleFunc("/status", w.handleStatus)
 }
 
@@ -241,11 +242,16 @@ function renderRooms(rooms) {
     };
     const stateText = stateTextMap[room.state] || (room.state || '');
     const canStart = !!room.can_start;
-    const actionBtn = canStop
-      ? '<button class="btn-danger" onclick="stopOneByUrl(this.dataset.url)" data-url="' + encodeURIComponent(room.url || '') + '">停止</button>'
-      : (canStart
-          ? '<button onclick="startByUrl(this.dataset.url)" data-url="' + encodeURIComponent(room.url || '') + '">启动</button>'
-          : '<button disabled>处理中</button>');
+    const encodedURL = encodeURIComponent(room.url || '');
+    let actionBtn = '';
+    if (canStop) {
+      actionBtn = '<button class="btn-danger" onclick="stopOneByUrl(this.dataset.url)" data-url="' + encodedURL + '">停止</button>';
+    } else if (canStart) {
+      actionBtn = '<button onclick="startByUrl(this.dataset.url)" data-url="' + encodedURL + '">启动</button>';
+    } else {
+      actionBtn = '<button disabled>处理中</button>';
+    }
+    actionBtn += '<button class="btn-danger" onclick="deleteRoomByUrl(this.dataset.url)" data-url="' + encodedURL + '">删除</button>';
     const stateClass = room.state === 'running' ? 'state-badge state-running' : 'state-badge';
     tr.innerHTML =
       '<td class="room-name">' + (room.room_base_name || '') + '</td>' +
@@ -319,6 +325,20 @@ async function startByUrl(encodedURL) {
 
 async function stopAll() {
   const r = await fetch('/stop', {method:'POST'});
+  alert((await r.json()).message);
+  refresh();
+}
+
+async function deleteRoomByUrl(encodedURL) {
+  const url = decodeURIComponent(encodedURL || '');
+  if (!confirm('确认删除该直播间？')) {
+    return;
+  }
+  const r = await fetch('/delete', {
+    method:'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({url})
+  });
   alert((await r.json()).message);
   refresh();
 }
@@ -399,6 +419,25 @@ func (w *WebUI) handleStop(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(rw, http.StatusOK, map[string]any{"message": "stopping"})
+}
+
+func (w *WebUI) handleDelete(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(rw, http.StatusMethodNotAllowed, map[string]any{"message": "method not allowed"})
+		return
+	}
+	var req struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(rw, http.StatusBadRequest, map[string]any{"message": "bad json"})
+		return
+	}
+	if err := w.rec.DeleteRoom(req.URL); err != nil {
+		writeJSON(rw, http.StatusBadRequest, map[string]any{"message": err.Error()})
+		return
+	}
+	writeJSON(rw, http.StatusOK, map[string]any{"message": "room deleted"})
 }
 
 func writeJSON(rw http.ResponseWriter, code int, v any) {

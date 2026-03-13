@@ -61,6 +61,8 @@ type roomRecorder struct {
 	sessionDir  string
 	filePrefix  string
 	baseDirName string
+
+	stopEvents []time.Time
 }
 
 type Recorder struct {
@@ -369,6 +371,7 @@ func (r *Recorder) startRoomLocked(room *roomRecorder, ignoreCooldown bool) erro
 	room.sessionDir = baseDir
 	room.filePrefix = startStamp + "_"
 	room.baseDirName = baseDirName
+	room.stopEvents = nil
 	room.runCtx, room.cancelRun = context.WithCancel(context.Background())
 
 	go r.runRoom(room.runCtx, room.url, room.sessionDir)
@@ -406,6 +409,28 @@ func (r *Recorder) Stop(m3u8URL string) error {
 	room.state = StateStopping
 	if room.cancelRun != nil {
 		room.cancelRun()
+	}
+	return nil
+}
+
+func (r *Recorder) DeleteRoom(m3u8URL string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if m3u8URL == "" {
+		return errors.New("m3u8 url is empty")
+	}
+	room, ok := r.rooms[m3u8URL]
+	if !ok {
+		return errors.New("room not found")
+	}
+	if room.state == StateRunning || room.state == StateStopping {
+		return errors.New("room is running, please stop it first")
+	}
+	delete(r.rooms, m3u8URL)
+	if err := r.saveRoomsLocked(); err != nil {
+		r.rooms[m3u8URL] = room
+		return err
 	}
 	return nil
 }
@@ -479,24 +504,60 @@ func (r *Recorder) setStats(url string, segCount, totalBytes int64) {
 
 func (r *Recorder) runRoom(ctx context.Context, m3u8URL, sessionDir string) {
 	go r.monitorStats(ctx, m3u8URL, sessionDir, "")
-	err := r.runFFmpegOnce(ctx, m3u8URL, sessionDir)
-	if errors.Is(ctx.Err(), context.Canceled) {
-		r.setIdle(m3u8URL)
-		return
+	for {
+		err := r.runFFmpegOnce(ctx, m3u8URL, sessionDir)
+		if errors.Is(ctx.Err(), context.Canceled) {
+			r.setIdle(m3u8URL)
+			return
+		}
+
+		shouldCooldown := r.recordStopAndCheckCooldown(m3u8URL)
+		if shouldCooldown {
+			log.Printf("[room=%s] stop count exceeded threshold in 1 minute, delay next start for %s", m3u8URL, endlistRetryInterval)
+			r.setIdleWithCooldown(m3u8URL, endlistRetryInterval, "stopped too frequently, waiting 15m before retry")
+			return
+		}
+
+		if err != nil {
+			log.Printf("[room=%s] ffmpeg stopped unexpectedly, restarting now: %v", m3u8URL, err)
+		} else {
+			log.Printf("[room=%s] stream ended/disconnected, restarting now", m3u8URL)
+		}
+
+		select {
+		case <-ctx.Done():
+			r.setIdle(m3u8URL)
+			return
+		case <-time.After(300 * time.Millisecond):
+		}
 	}
-	if err != nil {
-		r.setError(m3u8URL, err)
-		return
+}
+
+func (r *Recorder) recordStopAndCheckCooldown(url string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	room, ok := r.rooms[url]
+	if !ok {
+		return false
 	}
-	log.Printf("[room=%s] stream ended normally, delay next start for %s", m3u8URL, endlistRetryInterval)
-	r.setIdleWithCooldown(m3u8URL, endlistRetryInterval, "stream ended (EXT-X-ENDLIST), waiting before next retry")
+	now := time.Now()
+	windowStart := now.Add(-1 * time.Minute)
+	filtered := room.stopEvents[:0]
+	for _, t := range room.stopEvents {
+		if t.After(windowStart) {
+			filtered = append(filtered, t)
+		}
+	}
+	room.stopEvents = append(filtered, now)
+	return len(room.stopEvents) > 3
 }
 
 func (r *Recorder) runFFmpegOnce(ctx context.Context, m3u8URL, sessionDir string) error {
 	segmentPattern := filepath.Join(sessionDir, "%Y%m%d_%H%M%S.ts")
 	args := []string{
 		"-hide_banner",
-		"-loglevel", "warning",
+		"-loglevel", "error",
 		"-fflags", "+discardcorrupt",
 		"-rw_timeout", "15000000",
 		"-reconnect", "1",
